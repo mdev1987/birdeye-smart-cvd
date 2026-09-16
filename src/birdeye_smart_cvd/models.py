@@ -26,6 +26,8 @@ class TokenCandidate:
     risk_score: int | None = None
     # Short risk/veto annotations (e.g. "rug:blocked score=87").
     risk_flags: tuple[str, ...] = ()
+    # Helius holder concentration: top-10 share of supply when known.
+    top10_holder_pct: float | None = None
     # Where the current price_usd came from: discovery/trade/jupiter/dex.
     price_source: str = "discovery"
 

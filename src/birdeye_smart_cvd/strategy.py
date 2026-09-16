@@ -539,3 +539,117 @@ def parse_cluster_for_token(signals: list[Any], token_address: str) -> int | Non
                         break
         return found
     return None
+
+
+# ---------------------------------------------------------------------------
+# Helius: holder concentration and on-chain wallet-buy verification.
+# ---------------------------------------------------------------------------
+
+def _account_ui_amount(account: dict[str, Any]) -> float | None:
+    """Extract a UI-adjusted token balance from a largest-accounts entry."""
+    for key in ("uiAmount", "uiAmountString"):
+        amount = _parse_float(account.get(key))
+        if amount is not None and amount >= 0:
+            return amount
+    raw_amount = _parse_int(account.get("amount"))
+    decimals = _parse_int(account.get("decimals"))
+    if raw_amount is not None and decimals is not None and decimals >= 0:
+        try:
+            return raw_amount / (10**decimals)
+        except (OverflowError, ZeroDivisionError):
+            return None
+    return None
+
+
+def tagged_owners(rows: list[dict[str, Any]], smart_tags: tuple[str, ...]) -> list[str]:
+    """Return owner addresses of rows carrying a wanted tag, deduped."""
+    wanted = set(smart_tags)
+    owners: list[str] = []
+    for row in rows:
+        if not _tags(row) & wanted:
+            continue
+        owner = row.get("owner", row.get("wallet", row.get("address", "")))
+        if isinstance(owner, str) and owner.strip() and owner.strip() not in owners:
+            owners.append(owner.strip())
+    return owners
+
+
+def top_holder_pct(
+    accounts: list[dict[str, Any]], supply: float | None, *, top_n: int = 10
+) -> tuple[float | None, float | None]:
+    """Return (top1_pct, topN_pct) of supply held, or Nones when unknown.
+
+    Needs total ``supply``; without it no percentage is computable and
+    (None, None) is returned rather than a misleading number.
+    """
+    if not supply or supply <= 0 or top_n < 1:
+        return None, None
+    balances = sorted(
+        (
+            balance
+            for account in accounts
+            if isinstance(account, dict)
+            for balance in [_account_ui_amount(account)]
+            if balance is not None
+        ),
+        reverse=True,
+    )
+    if not balances:
+        return None, None
+    top1 = balances[0] / supply * 100.0
+    topn = sum(balances[:top_n]) / supply * 100.0
+    return top1, topn
+
+
+def _transfer_timestamp(transfer: dict[str, Any]) -> int | None:
+    """Extract a Unix timestamp from a Helius transfer row, if any."""
+    return _parse_int(
+        _first_present(transfer, "timestamp", "blockTime", "block_time", "blocktime")
+    )
+
+
+def count_wallet_buys(
+    transfers: list[Any],
+    wallet: str,
+    mint: str,
+    *,
+    since_unix: int | None = None,
+) -> tuple[int, float]:
+    """Count inbound transfers of ``mint`` to ``wallet`` (optionally recent).
+
+    The server already filters by wallet/mint/direction; this re-checks
+    defensively (exact match first, case-insensitive fallback) and applies
+    the recency window. Returns (count, total_ui_amount).
+    """
+    wanted_wallet = (wallet or "").strip()
+    wanted_mint = (mint or "").strip()
+    count = 0
+    total = 0.0
+    for transfer in transfers:
+        if not isinstance(transfer, dict):
+            continue
+        to_value = str(
+            _first_present(
+                transfer, "toUserAccount", "to", "destination", "toAddress", "to_address"
+            )
+            or ""
+        )
+        mint_value = str(
+            _first_present(transfer, "mint", "tokenMint", "mintAddress", "mint_address")
+            or ""
+        )
+        if to_value != wanted_wallet and to_value.lower() != wanted_wallet.lower():
+            continue
+        if mint_value != wanted_mint and mint_value.lower() != wanted_mint.lower():
+            continue
+        if since_unix is not None:
+            stamp = _transfer_timestamp(transfer)
+            if stamp is None or stamp < since_unix:
+                continue
+        count += 1
+        amount = _parse_float(
+            _first_present(transfer, "tokenAmount", "amount", "uiAmount", "ui_amount")
+        )
+        if amount:
+            total += amount
+    return count, total

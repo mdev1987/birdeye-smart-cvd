@@ -10,11 +10,13 @@ from .birdeye import BirdeyeClient, BirdeyeError
 from .cabalspy import CabalSpyClient, CabalSpyError
 from .config import Settings
 from .dexscreener import DexScreenerClient, DexScreenerError
+from .helius import HeliusClient, HeliusError
 from .jupiter import JupiterClient, JupiterError
 from .models import PositionState, TokenCandidate
 from .rugcheck import RugCheckClient, RugCheckError
 from .strategy import (
     RollingCVD,
+    count_wallet_buys,
     enrichment_from_pair,
     entry_allowed,
     jupiter_age_unix,
@@ -28,6 +30,8 @@ from .strategy import (
     rugcheck_verdict,
     select_best_pair,
     smart_money_stats,
+    tagged_owners,
+    top_holder_pct,
 )
 
 log = logging.getLogger(__name__)
@@ -85,9 +89,25 @@ class Scanner:
             if settings.cabalspy_enabled:
                 log.info("CabalSpy disabled: set CABALSPY_API_KEY to enable cluster confirmation")
 
+        if settings.helius_enabled and settings.helius_api_key:
+            self.helius: HeliusClient | None = HeliusClient(
+                settings.helius_api_key,
+                settings.helius_rpc_url,
+                min_request_interval=settings.helius_min_request_interval_seconds,
+            )
+            log.info("Helius holder/verify checks enabled")
+        else:
+            self.helius = None
+            if settings.helius_enabled:
+                log.info("Helius disabled: set HELIUS_API_KEY to enable holder/verify checks")
+        if settings.helius_require_confirmed and self.helius is None:
+            log.warning("HELIUS_REQUIRE_CONFIRMED is set but Helius is disabled; gate is inert")
+        if settings.cabalspy_require_cluster and self.cabal is None:
+            log.warning("CABALSPY_REQUIRE_CLUSTER is set but CabalSpy is disabled; gate is inert")
+
     async def aclose(self) -> None:
         """Close auxiliary HTTP clients (Birdeye client is owned by main)."""
-        for aux in (self.dex, self.jup, self.rug, self.cabal):
+        for aux in (self.dex, self.jup, self.rug, self.cabal, self.helius):
             if aux is not None:
                 try:
                     await aux.close()
@@ -190,6 +210,60 @@ class Scanner:
                 return (now - creation_unix) / 3600.0, "creation_info"
         return None, "unknown"
 
+    async def _helius_concentration(self, candidate: TokenCandidate) -> bool:
+        """Check holder concentration. Fail-open; optional veto. True == keep."""
+        if self.helius is None:
+            return True
+        try:
+            accounts = await self.helius.largest_accounts(candidate.address)
+            supply = await self.helius.token_supply(candidate.address)
+        except HeliusError as exc:
+            log.warning("helius holders failed %-10s: %s", candidate.symbol, exc)
+            return True
+        _top1, top10 = top_holder_pct(accounts, supply)
+        candidate.top10_holder_pct = top10
+        if top10 is None:
+            return True
+        if (
+            self.settings.helius_reject_concentration
+            and top10 > self.settings.helius_top10_max_pct
+        ):
+            log.info(
+                "skip %-10s holder concentration top10=%.1f%% > %.0f%%",
+                candidate.symbol,
+                top10,
+                self.settings.helius_top10_max_pct,
+            )
+            return False
+        return True
+
+    async def _helius_confirmed(
+        self, token_address: str, owners: list[str]
+    ) -> tuple[int, int] | None:
+        """Count owners with on-chain buys in the window. None when skipped."""
+        if (
+            self.helius is None
+            or not self.settings.helius_verify_wallets
+            or not owners
+        ):
+            return None
+        since = int(time.time()) - self.settings.helius_verify_window_hours * 3600
+        confirmed = 0
+        checked = 0
+        for owner in owners[: self.settings.top_traders_limit]:
+            try:
+                transfers = await self.helius.inbound_transfers(
+                    owner, token_address, limit=self.settings.helius_verify_limit
+                )
+            except HeliusError as exc:
+                log.warning("helius verify failed %s: %s", owner[:8], exc)
+                continue
+            checked += 1
+            buys, _amount = count_wallet_buys(transfers, owner, token_address, since_unix=since)
+            if buys > 0:
+                confirmed += 1
+        return confirmed, checked
+
     async def _rugcheck_ok(self, candidate: TokenCandidate) -> bool:
         """Apply the RugCheck pre-entry veto. Fail-open unless strict."""
         if self.rug is None:
@@ -225,6 +299,8 @@ class Scanner:
         """Discover a small candidate universe from Birdeye Trending."""
         rows = await self.client.trending(self.settings.candidate_limit)
         candidates: dict[str, TokenCandidate] = {}
+        base_filtered = 0
+        gated_filtered = 0
 
         for row in rows:
             address = str(row.get("address", row.get("token", "")))
@@ -254,16 +330,21 @@ class Scanner:
                         candidate.symbol,
                     )
             if candidate is None:
+                base_filtered += 1
                 continue
             if candidate.liquidity_usd < self.settings.min_liquidity_usd:
+                base_filtered += 1
                 continue
             if not self.settings.min_market_cap_usd <= candidate.market_cap_usd <= self.settings.max_market_cap_usd:
+                base_filtered += 1
                 continue
             if candidate.price_change_24h_pct > self.settings.max_price_change_24h_percent:
+                base_filtered += 1
                 continue
             if self.settings.enforce_token_age:
                 age_hours, age_source = await self._resolve_age(address, dex_pairs, jup_entry)
                 if not self._apply_age_gate(candidate, age_hours, age_source):
+                    gated_filtered += 1
                     log.info(
                         "skip %-10s age=%s exceeds %dh",
                         candidate.symbol,
@@ -273,7 +354,11 @@ class Scanner:
                     continue
             if self.settings.rugcheck_enabled:
                 if not await self._rugcheck_ok(candidate):
+                    gated_filtered += 1
                     continue
+            if not await self._helius_concentration(candidate):
+                gated_filtered += 1
+                continue
 
             candidates[address] = candidate
             if len(candidates) >= self.settings.max_watched_tokens:
@@ -285,11 +370,22 @@ class Scanner:
             self.cvd.setdefault(address, RollingCVD(self.settings.cvd_window_seconds))
 
         self.last_discovery = time.time()
-        log.info("discovered %d candidates", len(self.watched))
+        log.info(
+            "discovered %d candidates (%d trending, %d base-filtered, %d age/risk-filtered)",
+            len(self.watched),
+            len(rows),
+            base_filtered,
+            gated_filtered,
+        )
         for token in self.watched.values():
             risk_text = f" risk={token.risk_score}" if token.risk_score is not None else ""
+            top10_text = (
+                f" top10={token.top10_holder_pct:.1f}%"
+                if token.top10_holder_pct is not None
+                else ""
+            )
             log.info(
-                "candidate %-10s MC=$%s [%s] LP=$%s 24h=%+.1f%% age=%s%s %s",
+                "candidate %-10s MC=$%s [%s] LP=$%s 24h=%+.1f%% age=%s%s%s %s",
                 token.symbol,
                 f"{token.market_cap_usd:,.0f}",
                 token.market_cap_source or "?",
@@ -297,6 +393,7 @@ class Scanner:
                 token.price_change_24h_pct,
                 self._fmt_age(token),
                 risk_text,
+                top10_text,
                 token.address,
             )
 
@@ -508,9 +605,23 @@ class Scanner:
                         self.settings.cabalspy_min_wallets,
                     )
                     return
+            helius_note = ""
+            if self.helius is not None and self.settings.helius_verify_wallets:
+                verified = await self._helius_confirmed(
+                    token.address, tagged_owners(trader_rows, self.settings.smart_tags)
+                )
+                if verified is not None:
+                    confirmed, checked = verified
+                    helius_note = f" helius={confirmed}/{checked}"
+                    if self.settings.helius_require_confirmed and confirmed < 1:
+                        log.info(
+                            "skip BUY %-10s no Helius-confirmed buys (required)",
+                            token.symbol,
+                        )
+                        return
             self.positions[token.address] = PositionState(token.price_usd, now, token.symbol)
             log.warning(
-                "BUY SIGNAL %-10s price[%s]=$%.8f smart=%d smart_buy%%=%.0f CVD=$%+.0f ratio=%.2fx%s",
+                "BUY SIGNAL %-10s price[%s]=$%.8f smart=%d smart_buy%%=%.0f CVD=$%+.0f ratio=%.2fx%s%s",
                 token.symbol,
                 token.price_source,
                 token.price_usd,
@@ -519,6 +630,7 @@ class Scanner:
                 state.cvd_usd,
                 state.buy_sell_ratio,
                 f" cluster={cluster_wallets}" if cluster_wallets is not None else "",
+                helius_note,
             )
 
     async def _jupiter_price_usd(self, address: str) -> float | None:

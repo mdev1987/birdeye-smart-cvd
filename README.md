@@ -30,6 +30,7 @@ The playbook's dedicated Smart Money Token List is intentionally **not** used be
 | Jupiter lite Price v3 | free, keyless | token-level `createdAt` age oracle, poll price fallback | skipped with warning |
 | RugCheck summary | free (~3 RPS) | pre-entry veto (`score_normalised`, `danger` risks) | allowed as `rug:unknown` (strict mode rejects) |
 | CabalSpy | key required, inert without one | advisory cluster confirmation | skipped with info log |
+| Helius RPC + transfers | key required, inert without one | holder concentration (`top10%`), on-chain buy proof per tagged wallet | skipped with info log; veto/require gates default OFF |
 
 Every auxiliary source fails open (warn + continue) except under its explicit `*_STRICT` / `REQUIRE` flag. The scanner never sends transactions.
 

@@ -118,6 +118,21 @@ class Settings:
     cabalspy_require_cluster: bool = False
     cabalspy_min_request_interval_seconds: float = 1.0
 
+    # Helius RPC + transfers (holder concentration, on-chain buy proof).
+    # Inert unless HELIUS_API_KEY is set. Concentration veto and buy-proof
+    # gating both default OFF (advisory logs only) so fresh pump.fun-style
+    # distributions and Helius outages can never silently kill signals.
+    helius_api_key: str = ""
+    helius_enabled: bool = True
+    helius_rpc_url: str = "https://mainnet.helius-rpc.com"
+    helius_min_request_interval_seconds: float = 0.3
+    helius_top10_max_pct: float = 60.0
+    helius_reject_concentration: bool = False
+    helius_verify_wallets: bool = True
+    helius_require_confirmed: bool = False
+    helius_verify_window_hours: int = 24
+    helius_verify_limit: int = 10
+
     @classmethod
     def from_env(cls) -> "Settings":
         """Build settings from environment variables and validate them."""
@@ -181,6 +196,20 @@ class Settings:
             cabalspy_min_request_interval_seconds=_float(
                 "CABALSPY_MIN_REQUEST_INTERVAL_SECONDS", 1.0
             ),
+            helius_api_key=(_raw("HELIUS_API_KEY") or ""),
+            helius_enabled=_bool("HELIUS_ENABLED", True),
+            helius_rpc_url=(
+                _raw("HELIUS_RPC_URL") or _raw("HELIUS_RPC") or "https://mainnet.helius-rpc.com"
+            ),
+            helius_min_request_interval_seconds=_float(
+                "HELIUS_MIN_REQUEST_INTERVAL_SECONDS", 0.3
+            ),
+            helius_top10_max_pct=_float("HELIUS_TOP10_MAX_PCT", 60.0),
+            helius_reject_concentration=_bool("HELIUS_REJECT_CONCENTRATION", False),
+            helius_verify_wallets=_bool("HELIUS_VERIFY_WALLETS", True),
+            helius_require_confirmed=_bool("HELIUS_REQUIRE_CONFIRMED", False),
+            helius_verify_window_hours=_int("HELIUS_VERIFY_WINDOW_HOURS", 24),
+            helius_verify_limit=_int("HELIUS_VERIFY_LIMIT", 10),
         )
 
         if settings.chain != "solana":
@@ -201,11 +230,18 @@ class Settings:
             raise ValueError("RUGCHECK_MAX_SCORE must be between 0 and 100")
         if settings.cabalspy_min_wallets < 1:
             raise ValueError("CABALSPY_MIN_WALLETS must be >= 1")
+        if not 0 < settings.helius_top10_max_pct <= 100:
+            raise ValueError("HELIUS_TOP10_MAX_PCT must be between 0 (exclusive) and 100")
+        if settings.helius_verify_window_hours < 1:
+            raise ValueError("HELIUS_VERIFY_WINDOW_HOURS must be >= 1")
+        if not 1 <= settings.helius_verify_limit <= 100:
+            raise ValueError("HELIUS_VERIFY_LIMIT must be between 1 and 100")
         for name, interval in (
             ("DEXSCREENER_MIN_REQUEST_INTERVAL_SECONDS", settings.dexscreener_min_request_interval_seconds),
             ("JUPITER_MIN_REQUEST_INTERVAL_SECONDS", settings.jupiter_min_request_interval_seconds),
             ("RUGCHECK_MIN_REQUEST_INTERVAL_SECONDS", settings.rugcheck_min_request_interval_seconds),
             ("CABALSPY_MIN_REQUEST_INTERVAL_SECONDS", settings.cabalspy_min_request_interval_seconds),
+            ("HELIUS_MIN_REQUEST_INTERVAL_SECONDS", settings.helius_min_request_interval_seconds),
         ):
             if interval < 0:
                 raise ValueError(f"{name} must be >= 0")
