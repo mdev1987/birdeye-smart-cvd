@@ -54,7 +54,7 @@ class Settings:
     api_key: str
     chain: str = "solana"
     base_url: str = "https://public-api.birdeye.so"
-    api_min_request_interval_seconds: float = 1.15
+    api_min_request_interval_seconds: float = 1.5
 
     discovery_interval_seconds: int = 300
     poll_interval_seconds: int = 30
@@ -114,7 +114,7 @@ class Settings:
         settings = cls(
             api_key=api_key,
             chain=(_raw("CHAIN") or "solana").lower(),
-            api_min_request_interval_seconds=_float("API_MIN_REQUEST_INTERVAL_SECONDS", 1.15),
+            api_min_request_interval_seconds=_float("API_MIN_REQUEST_INTERVAL_SECONDS", 1.5),
             discovery_interval_seconds=_int("DISCOVERY_INTERVAL_SECONDS", 300),
             poll_interval_seconds=_int("POLL_INTERVAL_SECONDS", 30),
             candidate_limit=_int("CANDIDATE_LIMIT", 10),

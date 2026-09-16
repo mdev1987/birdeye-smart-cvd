@@ -55,4 +55,4 @@ uv run python -m unittest discover -s tests -v
 
 ## Rate limiting
 
-The client serializes requests (including 429 backoff) behind a single lock and waits 1.5 seconds between request starts by default. Birdeye Standard is documented at 1 RPS, so the scanner intentionally does not use concurrent API calls. The 1.5s value comes from a 5-minute live run: at 1.15s Birdeye 429'd every second request (phase-locked just under its real window), each recovered transparently via retry. Tune with `API_MIN_REQUEST_INTERVAL_SECONDS` (minimum 1.0, enforced).
+The client serializes requests (including 429 backoff) behind a single lock and waits 1.5 seconds between requests by default, anchored at response completion so slow answers can't compress the gap. Birdeye Standard is documented at 1 RPS, so the scanner intentionally does not use concurrent API calls. The 1.5s value comes from live runs: at start-anchored 1.15s Birdeye 429'd every second request (phase-locked just under its real window); completion-anchored 1.5s reduced that to the occasional retry, each recovered transparently. Tune with `API_MIN_REQUEST_INTERVAL_SECONDS` (minimum 1.0, enforced).

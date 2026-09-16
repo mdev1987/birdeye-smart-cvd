@@ -18,9 +18,10 @@ class BirdeyeClient:
 
     Birdeye's free Standard package is documented at 1 request per second.
     The client therefore serializes all requests (including 429 backoff
-    sleeps) behind a single lock, so the 1 RPS spacing holds even if the
-    caller later moves from sequential polling to ``asyncio.gather``.
-    A short retry is also used for HTTP 429.
+    sleeps) behind a single lock and spaces them by ``min_request_interval``.
+    Spacing is anchored at request *completion*: after each response the
+    timestamp resets, so the server always sees a full quiet gap even when
+    responses themselves are slow. A short retry is also used for HTTP 429.
     """
 
     def __init__(
@@ -29,7 +30,7 @@ class BirdeyeClient:
         api_key: str,
         chain: str = "solana",
         *,
-        min_request_interval: float = 1.15,
+        min_request_interval: float = 1.5,
         max_429_retries: int = 2,
     ) -> None:
         self._client = httpx.AsyncClient(
@@ -80,7 +81,15 @@ class BirdeyeClient:
                 try:
                     response = await self._client.get(path, params=params)
                 except httpx.HTTPError as exc:
+                    # Anchor spacing at completion even on failure, so a
+                    # slow/hung request cannot compress the next gap.
+                    self._last_request_at = time.monotonic()
                     raise BirdeyeError(f"network error: {exc}") from exc
+                # Completion-anchored spacing: the next request starts a
+                # full interval after this response arrived, not after the
+                # request started. (Start-anchored gaps collapse when the
+                # server itself is slow to answer.)
+                self._last_request_at = time.monotonic()
 
                 if response.status_code == 429:
                     if attempt >= self._max_429_retries:
