@@ -95,6 +95,29 @@ class Settings:
     enforce_token_age: bool = True
     age_strict: bool = False
 
+    # Free keyless enrichment (DexScreener pairs, Jupiter price). These sit
+    # outside the Birdeye CU budget with their own polite spacing.
+    dexscreener_enabled: bool = True
+    dexscreener_min_request_interval_seconds: float = 0.3
+    jupiter_enabled: bool = True
+    jupiter_min_request_interval_seconds: float = 0.5
+
+    # RugCheck pre-entry veto (free summary endpoint, ~3 RPS tier).
+    rugcheck_enabled: bool = True
+    rugcheck_max_score: int = 50
+    rugcheck_reject_danger: bool = True
+    rugcheck_strict: bool = False
+    rugcheck_min_request_interval_seconds: float = 0.4
+
+    # Optional CabalSpy cluster confirmation. Inert unless a key is set;
+    # advisory-only unless require_cluster is enabled, so an outage can
+    # never silence entries by default.
+    cabalspy_api_key: str = ""
+    cabalspy_enabled: bool = True
+    cabalspy_min_wallets: int = 3
+    cabalspy_require_cluster: bool = False
+    cabalspy_min_request_interval_seconds: float = 1.0
+
     @classmethod
     def from_env(cls) -> "Settings":
         """Build settings from environment variables and validate them."""
@@ -136,6 +159,28 @@ class Settings:
             bearish_exit_confirmations=_int("BEARISH_EXIT_CONFIRMATIONS", 2),
             enforce_token_age=_bool("ENFORCE_TOKEN_AGE", True),
             age_strict=_bool("AGE_STRICT", False),
+            dexscreener_enabled=_bool("DEXSCREENER_ENABLED", True),
+            dexscreener_min_request_interval_seconds=_float(
+                "DEXSCREENER_MIN_REQUEST_INTERVAL_SECONDS", 0.3
+            ),
+            jupiter_enabled=_bool("JUPITER_ENABLED", True),
+            jupiter_min_request_interval_seconds=_float(
+                "JUPITER_MIN_REQUEST_INTERVAL_SECONDS", 0.5
+            ),
+            rugcheck_enabled=_bool("RUGCHECK_ENABLED", True),
+            rugcheck_max_score=_int("RUGCHECK_MAX_SCORE", 50),
+            rugcheck_reject_danger=_bool("RUGCHECK_REJECT_DANGER", True),
+            rugcheck_strict=_bool("RUGCHECK_STRICT", False),
+            rugcheck_min_request_interval_seconds=_float(
+                "RUGCHECK_MIN_REQUEST_INTERVAL_SECONDS", 0.4
+            ),
+            cabalspy_api_key=(_raw("CABALSPY_API_KEY") or ""),
+            cabalspy_enabled=_bool("CABALSPY_ENABLED", True),
+            cabalspy_min_wallets=_int("CABALSPY_MIN_WALLETS", 3),
+            cabalspy_require_cluster=_bool("CABALSPY_REQUIRE_CLUSTER", False),
+            cabalspy_min_request_interval_seconds=_float(
+                "CABALSPY_MIN_REQUEST_INTERVAL_SECONDS", 1.0
+            ),
         )
 
         if settings.chain != "solana":
@@ -152,5 +197,17 @@ class Settings:
             raise ValueError("BEARISH_EXIT_CONFIRMATIONS must be >= 1")
         if settings.max_token_age_hours < 1:
             raise ValueError("MAX_TOKEN_AGE_HOURS must be >= 1")
+        if not 0 <= settings.rugcheck_max_score <= 100:
+            raise ValueError("RUGCHECK_MAX_SCORE must be between 0 and 100")
+        if settings.cabalspy_min_wallets < 1:
+            raise ValueError("CABALSPY_MIN_WALLETS must be >= 1")
+        for name, interval in (
+            ("DEXSCREENER_MIN_REQUEST_INTERVAL_SECONDS", settings.dexscreener_min_request_interval_seconds),
+            ("JUPITER_MIN_REQUEST_INTERVAL_SECONDS", settings.jupiter_min_request_interval_seconds),
+            ("RUGCHECK_MIN_REQUEST_INTERVAL_SECONDS", settings.rugcheck_min_request_interval_seconds),
+            ("CABALSPY_MIN_REQUEST_INTERVAL_SECONDS", settings.cabalspy_min_request_interval_seconds),
+        ):
+            if interval < 0:
+                raise ValueError(f"{name} must be >= 0")
 
         return settings

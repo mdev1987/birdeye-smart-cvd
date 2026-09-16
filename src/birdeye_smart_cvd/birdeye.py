@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Any
 
 import httpx
+
+from .ratelimit import AsyncRateLimiter
 
 
 class BirdeyeError(RuntimeError):
@@ -44,8 +45,7 @@ class BirdeyeClient:
         )
         self._min_request_interval = max(1.0, min_request_interval)
         self._max_429_retries = max(0, max_429_retries)
-        self._last_request_at = 0.0
-        self._rate_lock = asyncio.Lock()
+        self._limiter = AsyncRateLimiter(self._min_request_interval)
 
     async def __aenter__(self) -> "BirdeyeClient":
         """Enter the async client context."""
@@ -59,37 +59,20 @@ class BirdeyeClient:
         """Close the HTTP client."""
         await self._client.aclose()
 
-    async def _wait_for_slot_locked(self) -> None:
-        """Wait until the next request may safely start.
-
-        Must be called with ``self._rate_lock`` already held.
-        """
-        elapsed = time.monotonic() - self._last_request_at
-        delay = self._min_request_interval - elapsed
-        if delay > 0:
-            await asyncio.sleep(delay)
-        self._last_request_at = time.monotonic()
-
     async def get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         """Perform a rate-limited GET request with limited 429 retries."""
         # The whole attempt loop holds the lock so request spacing and
         # 429 backoff stay globally serialized even under concurrent use.
-        async with self._rate_lock:
+        async with self._limiter:
             for attempt in range(self._max_429_retries + 1):
-                await self._wait_for_slot_locked()
+                await self._limiter.pace()
 
                 try:
                     response = await self._client.get(path, params=params)
                 except httpx.HTTPError as exc:
-                    # Anchor spacing at completion even on failure, so a
-                    # slow/hung request cannot compress the next gap.
-                    self._last_request_at = time.monotonic()
+                    self._limiter.mark()
                     raise BirdeyeError(f"network error: {exc}") from exc
-                # Completion-anchored spacing: the next request starts a
-                # full interval after this response arrived, not after the
-                # request started. (Start-anchored gaps collapse when the
-                # server itself is slow to answer.)
-                self._last_request_at = time.monotonic()
+                self._limiter.mark()
 
                 if response.status_code == 429:
                     if attempt >= self._max_429_retries:

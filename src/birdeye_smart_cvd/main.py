@@ -33,7 +33,11 @@ async def run() -> None:
         settings.chain,
         min_request_interval=settings.api_min_request_interval_seconds,
     ) as client:
-        await Scanner(client, settings).run()
+        scanner = Scanner(client, settings)
+        try:
+            await scanner.run()
+        finally:
+            await scanner.aclose()
 
 
 def main() -> None:

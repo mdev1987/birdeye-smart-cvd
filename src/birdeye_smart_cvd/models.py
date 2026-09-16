@@ -20,8 +20,14 @@ class TokenCandidate:
     market_cap_source: str = ""
     # Token age in hours when known, otherwise None.
     age_hours: float | None = None
-    # Where the age came from: "creation_info", "new_listing", "unknown".
+    # Where the age came from: "jupiter", "dexscreener", "creation_info".
     age_source: str = "unknown"
+    # RugCheck normalized score when checked, otherwise None.
+    risk_score: int | None = None
+    # Short risk/veto annotations (e.g. "rug:blocked score=87").
+    risk_flags: tuple[str, ...] = ()
+    # Where the current price_usd came from: discovery/trade/jupiter/dex.
+    price_source: str = "discovery"
 
 
 @dataclass(slots=True)

@@ -90,6 +90,28 @@ def _parse_int(value: Any) -> int | None:
         return None
 
 
+def parse_iso_unix(text: Any) -> int | None:
+    """Parse an ISO-8601 timestamp (or plain Unix seconds) to Unix seconds."""
+    if isinstance(text, (int, float)):
+        stamp = int(text)
+        return stamp if stamp > 0 else None
+    if not isinstance(text, str) or not text.strip():
+        return None
+    cleaned = text.strip()
+    if cleaned.endswith(("Z", "z")):
+        cleaned = cleaned[:-1] + "+00:00"
+    try:
+        from datetime import datetime, timezone
+
+        parsed = datetime.fromisoformat(cleaned)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        stamp = int(parsed.timestamp())
+        return stamp if stamp > 0 else None
+    except ValueError:
+        return None
+
+
 def parse_market_cap(data: dict[str, Any]) -> tuple[float, str]:
     """Extract a market-cap/FDV value and record which field supplied it.
 
@@ -128,21 +150,7 @@ def parse_creation_unix(data: dict[str, Any]) -> int | None:
         return direct
     # /defi/v2/tokens/new_listing reports ISO strings like
     # "2024-09-18T17:59:23" in liquidityAddedAt.
-    iso_raw = _first_present(data, "liquidityAddedAt", "liquidity_added_at")
-    if isinstance(iso_raw, str) and iso_raw.strip():
-        text = iso_raw.strip()
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        try:
-            from datetime import datetime
-
-            parsed = datetime.fromisoformat(text)
-            epoch = datetime(1970, 1, 1, tzinfo=parsed.tzinfo)
-            stamp = int((parsed - epoch).total_seconds())
-            return stamp if stamp > 0 else None
-        except ValueError:
-            return None
-    return None
+    return parse_iso_unix(_first_present(data, "liquidityAddedAt", "liquidity_added_at"))
 
 
 def _tags(row: dict[str, Any]) -> set[str]:
@@ -293,3 +301,241 @@ def entry_allowed(
         and cvd.buy_sell_ratio >= min_cvd_ratio
         and candidate.price_change_24h_pct <= max_price_change_24h
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-source enrichment: DexScreener ages, Jupiter birth/price, RugCheck
+# verdicts and CabalSpy cluster matches. All pure functions; every network
+# failure is handled by the caller (fail-open with a warning), never here.
+# ---------------------------------------------------------------------------
+
+_SOL_MINT = "so11111111111111111111111111111111111111112"
+_USDC_MINT = "epjfwdd5aufqssqem2qn1xzybapc8g4weggkzwytdt1v"
+_USDT_MINT = "es9vmfrzacerfjfrf4h2fyd4kcconky11mcce8benwnyb"
+_STABLE_SYMBOLS = {"sol", "wsol", "usdc", "usdt"}
+
+
+def _pair_leg_address(pair: dict[str, Any], leg: str) -> str:
+    """Return the mint address of a DexScreener pair leg, if any."""
+    node = pair.get(leg, {})
+    if not isinstance(node, dict):
+        return ""
+    for key in ("address", "mint"):
+        value = node.get(key, "")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _pair_leg_symbol(pair: dict[str, Any], leg: str) -> str:
+    """Return the symbol of a DexScreener pair leg, lowercased."""
+    node = pair.get(leg, {})
+    if not isinstance(node, dict):
+        return ""
+    symbol = node.get("symbol", "")
+    return str(symbol).strip().lower() if symbol else ""
+
+
+def _pair_liquidity_usd(pair: dict[str, Any]) -> float:
+    """Return DexScreener ``liquidity.usd`` as a float, else 0."""
+    liquidity = pair.get("liquidity", {})
+    if not isinstance(liquidity, dict):
+        return 0.0
+    return _parse_float(_first_present(liquidity, "usd")) or 0.0
+
+
+def _is_anchor_quote(pair: dict[str, Any]) -> bool:
+    """Return True when the quote leg is SOL/USDC/USDT (deep venues)."""
+    quote_addr = _pair_leg_address(pair, "quoteToken") or _pair_leg_address(pair, "quote")
+    if quote_addr.lower() in {_SOL_MINT, _USDC_MINT, _USDT_MINT}:
+        return True
+    return _pair_leg_symbol(pair, "quoteToken") in _STABLE_SYMBOLS
+
+
+def select_best_pair(
+    pairs: list[dict[str, Any]], token_address: str | None = None
+) -> dict[str, Any] | None:
+    """Pick the most trustworthy DexScreener pair for a token.
+
+    Preference order: token as base leg, anchor quote (SOL/USDC/USDT),
+    then highest USD liquidity. Dust meme-meme quote pairs sink to the
+    bottom instead of polluting enrichment.
+    """
+    wanted = (token_address or "").strip().lower()
+    scored: list[tuple[tuple[int, int, float], dict[str, Any]]] = []
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+        base_addr = (_pair_leg_address(pair, "baseToken") or _pair_leg_address(pair, "base")).lower()
+        quote_addr = (_pair_leg_address(pair, "quoteToken") or _pair_leg_address(pair, "quote")).lower()
+        involves = not wanted or wanted in {base_addr, quote_addr}
+        if not involves:
+            continue
+        is_base = bool(wanted) and base_addr == wanted
+        scored.append(
+            ((1 if is_base else 0, 1 if _is_anchor_quote(pair) else 0, _pair_liquidity_usd(pair)), pair)
+        )
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1]
+
+
+def pair_age_info(pairs: list[dict[str, Any]]) -> tuple[int | None, int]:
+    """Return (oldest pool Unix seconds or None, pair count).
+
+    A pool can only be created after both of its tokens exist, so the
+    minimum ``pairCreatedAt`` (Unix ms) is a *sound upper bound* on token
+    age: if the oldest pool is older than the limit, the token is
+    definitely too old (reject). If younger, the token *may* still be
+    older (permissive admission, same as today's unknown-age path).
+    """
+    stamps: list[int] = []
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+        raw = _first_present(pair, "pairCreatedAt", "pair_created_at", "createdAt", "created_at")
+        stamp_ms = _parse_int(raw)
+        if not stamp_ms or stamp_ms <= 0:
+            continue
+        stamps.append(stamp_ms // 1000 if stamp_ms > 10**12 else stamp_ms)
+    count = sum(1 for pair in pairs if isinstance(pair, dict))
+    return (min(stamps) if stamps else None, count)
+
+
+def enrichment_from_pair(pair: dict[str, Any]) -> dict[str, Any]:
+    """Extract price/liquidity/market-cap from one DexScreener pair."""
+    price = _parse_float(_first_present(pair, "priceUsd", "price_usd"))
+    market_cap = _parse_float(
+        _first_present(pair, "marketCap", "market_cap", "fdv", "FDV")
+    )
+    mc_source = ""
+    for key in ("marketCap", "market_cap"):
+        if _parse_float(pair.get(key)):
+            mc_source = f"dex:{key}"
+            break
+    if not mc_source:
+        for key in ("fdv", "FDV"):
+            if _parse_float(pair.get(key)):
+                mc_source = f"dex:{key}"
+                break
+    change = 0.0
+    price_change = pair.get("priceChange", pair.get("price_change", {}))
+    if isinstance(price_change, dict):
+        change = _parse_float(_first_present(price_change, "h24")) or 0.0
+    return {
+        "price_usd": price,
+        "liquidity_usd": _pair_liquidity_usd(pair),
+        "market_cap_usd": market_cap,
+        "market_cap_source": mc_source,
+        "price_change_24h_pct": change,
+    }
+
+
+def parse_jupiter_entry(payload: dict[str, Any], mint: str) -> dict[str, Any]:
+    """Return the Jupiter v3 price object for one mint, or {}."""
+    entry = payload.get(mint, payload.get(mint.strip(), {}))
+    return entry if isinstance(entry, dict) else {}
+
+
+def jupiter_age_unix(entry: dict[str, Any]) -> int | None:
+    """Extract token-level creation time from a Jupiter price object."""
+    return parse_iso_unix(_first_present(entry, "createdAt", "created_at"))
+
+
+def jupiter_price_usd(entry: dict[str, Any]) -> float | None:
+    """Extract USD price from a Jupiter price object."""
+    price = _parse_float(_first_present(entry, "usdPrice", "usd_price", "price"))
+    return price if price and price > 0 else None
+
+
+def rugcheck_verdict(
+    summary: dict[str, Any],
+    *,
+    max_score: int,
+    reject_danger: bool,
+) -> tuple[bool, list[str], int | None]:
+    """Judge a RugCheck summary: (allowed, reasons, score_normalised).
+
+    Pure function — unknown/missing data never blocks here; the caller's
+    ``RUGCHECK_STRICT`` flag decides what happens when no summary exists
+    at all. Rejects on excessive normalized score or any ``danger``-level
+    risk when ``reject_danger`` is set.
+    """
+    score = _parse_int(_first_present(summary, "score_normalised", "scoreNormalized"))
+    reasons: list[str] = []
+    allowed = True
+
+    risks = summary.get("risks", [])
+    dangers: list[str] = []
+    if isinstance(risks, list):
+        for risk in risks:
+            if not isinstance(risk, dict):
+                continue
+            if str(risk.get("level", "")).lower() == "danger":
+                dangers.append(str(risk.get("name", "unnamed risk")))
+    if dangers and reject_danger:
+        allowed = False
+        reasons.append("danger risks: " + ", ".join(dangers[:5]))
+
+    if score is not None and score > max_score:
+        allowed = False
+        reasons.append(f"score {score} > max {max_score}")
+
+    return allowed, reasons, score
+
+
+def parse_cluster_for_token(signals: list[Any], token_address: str) -> int | None:
+    """Return the clustered wallet count for a token, or None.
+
+    The signals envelope varies, so matches are attempted against every
+    plausible mint key (exact then case-insensitive) and the wallet count
+    against every plausible count key. None means "no usable signal",
+    which the caller treats as advisory-absent, never as zero.
+    """
+    wanted = (token_address or "").strip()
+    if not wanted:
+        return None
+    wanted_lower = wanted.lower()
+    mint_keys = ("mint", "token", "tokenAddress", "token_address", "address", "id", "mintAddress", "mint_address")
+    count_keys = ("wallets", "wallet_count", "walletCount", "count", "num_wallets", "numWallets", "walletCountTotal")
+
+    def _count(item: Any) -> int | None:
+        if isinstance(item, (int, float)):
+            return int(item)
+        if isinstance(item, list):
+            return len(item)
+        if isinstance(item, dict):
+            for key in count_keys:
+                value = item.get(key)
+                if isinstance(value, (int, float)) and int(value) >= 0:
+                    return int(value)
+                if isinstance(value, list):
+                    return len(value)
+            nested = item.get("cluster", item.get("data", None))
+            if nested is not item and nested is not None:
+                return _count(nested)
+        return None
+
+    for signal in signals:
+        if not isinstance(signal, dict):
+            continue
+        mint_value: Any = None
+        for key in mint_keys:
+            if signal.get(key) not in (None, ""):
+                mint_value = signal.get(key)
+                break
+        if not isinstance(mint_value, str):
+            continue
+        if mint_value != wanted and mint_value.lower() != wanted_lower:
+            continue
+        found = _count(signal)
+        if found is None:
+            for key in ("cluster", "data", "info"):
+                nested = signal.get(key)
+                if isinstance(nested, dict):
+                    found = _count(nested)
+                    if found is not None:
+                        break
+        return found
+    return None
