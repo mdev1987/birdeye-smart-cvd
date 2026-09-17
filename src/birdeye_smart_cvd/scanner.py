@@ -13,6 +13,7 @@ from .dexscreener import DexScreenerClient, DexScreenerError
 from .helius import HeliusClient, HeliusError
 from .jupiter import JupiterClient, JupiterError
 from .models import PositionState, TokenCandidate
+from .paper import PaperPortfolio
 from .rugcheck import RugCheckClient, RugCheckError
 from .strategy import (
     RollingCVD,
@@ -33,6 +34,7 @@ from .strategy import (
     tagged_owners,
     top_holder_pct,
 )
+from .telegram import CloseAlert, OpenAlert, StartupAlert, TelegramNotifier
 
 log = logging.getLogger(__name__)
 
@@ -40,13 +42,30 @@ log = logging.getLogger(__name__)
 class Scanner:
     """Signal-only scanner that deliberately performs no trades."""
 
-    def __init__(self, client: BirdeyeClient, settings: Settings) -> None:
+    def __init__(
+        self,
+        client: BirdeyeClient,
+        settings: Settings,
+        portfolio: PaperPortfolio | None = None,
+        notifier: TelegramNotifier | None = None,
+    ) -> None:
         self.client = client
         self.settings = settings
         self.cvd: dict[str, RollingCVD] = {}
         self.positions: dict[str, PositionState] = {}
         self.last_discovery = 0.0
         self.watched: dict[str, TokenCandidate] = {}
+        self.portfolio = portfolio or PaperPortfolio(
+            settings.paper_start_balance_usd,
+            settings.paper_position_size_usd,
+            settings.max_open_positions,
+        )
+        self.notifier = notifier or TelegramNotifier(
+            settings.telegram_bot_token,
+            settings.telegram_chat_id,
+            enabled=settings.telegram_enabled,
+        )
+        self._startup_sent = False
         # Cache of token creation timestamps (Unix seconds) or None when
         # the endpoint returned no usable time. Avoids re-paying the 30 CU
         # creation_info cost for the same address every discovery cycle.
@@ -107,7 +126,7 @@ class Scanner:
 
     async def aclose(self) -> None:
         """Close auxiliary HTTP clients (Birdeye client is owned by main)."""
-        for aux in (self.dex, self.jup, self.rug, self.cabal, self.helius):
+        for aux in (self.dex, self.jup, self.rug, self.cabal, self.helius, self.notifier):
             if aux is not None:
                 try:
                     await aux.close()
@@ -364,7 +383,7 @@ class Scanner:
             if len(candidates) >= self.settings.max_watched_tokens:
                 break
 
-        self._retire_dropped(candidates)
+        await self._retire_dropped(candidates)
         self.watched = candidates
         for address in self.watched:
             self.cvd.setdefault(address, RollingCVD(self.settings.cvd_window_seconds))
@@ -397,7 +416,55 @@ class Scanner:
                 token.address,
             )
 
-    def _retire_dropped(self, candidates: dict[str, TokenCandidate]) -> None:
+    async def _close_position(
+        self,
+        address: str,
+        token: TokenCandidate | None,
+        exit_price_usd: float,
+        *,
+        reason: str,
+        icon: str,
+        label: str,
+        log_level: str = "info",
+    ) -> None:
+        """Settle a paper position: accounting, log line and TG alert."""
+        position = self.positions.pop(address, None)
+        if position is None:
+            return
+        symbol = token.symbol if token is not None else position.symbol
+        name = (token.name if token is not None and token.name else position.name) or "?"
+        full_address = token.address if token is not None else address
+        entry = position.entry_price_usd
+        close_price = exit_price_usd if exit_price_usd and exit_price_usd > 0 else entry
+        result = self.portfolio.close(entry, close_price, position.notional_usd)
+        now = time.time()
+        getattr(log, log_level)("EXIT %-10s %s pnl=%+.1f%%", symbol, label, result.pnl_pct)
+        if self.notifier.enabled:
+            await self.notifier.send_close(
+                CloseAlert(
+                    symbol=symbol,
+                    name=name,
+                    address=full_address,
+                    reason=reason,
+                    reason_icon=icon,
+                    exit_price_usd=close_price,
+                    entry_price_usd=entry,
+                    pnl_usd=result.pnl_usd,
+                    pnl_pct=result.pnl_pct,
+                    hold_seconds=max(0.0, now - position.entry_time),
+                    cash_before_usd=result.cash_before_usd,
+                    cash_after_usd=result.cash_after_usd,
+                    realized_total_usd=result.realized_total_usd,
+                    wins=result.wins,
+                    losses=result.losses,
+                    win_rate_pct=result.win_rate_pct,
+                    open_positions=len(self.positions),
+                    max_open_positions=self.settings.max_open_positions,
+                    timestamp=now,
+                )
+            )
+
+    async def _retire_dropped(self, candidates: dict[str, TokenCandidate]) -> None:
         """Exit positions and drop CVD state for tokens leaving the universe.
 
         Without this, a position opened on a token that later disappears
@@ -406,15 +473,15 @@ class Scanner:
         """
         for address in list(self.positions):
             if address not in candidates:
-                position = self.positions.pop(address)
-                try:
-                    pnl_pct = (self.watched[address].price_usd / position.entry_price_usd - 1) * 100
-                except (KeyError, ZeroDivisionError):
-                    pnl_pct = float("nan")
-                log.warning(
-                    "EXIT %-10s DROPPED_FROM_UNIVERSE pnl=%+.1f%%",
-                    position.symbol,
-                    pnl_pct,
+                token = self.watched.get(address)
+                await self._close_position(
+                    address,
+                    token,
+                    token.price_usd if token is not None else 0.0,
+                    reason="Dropped from universe 🗑",
+                    icon="⚫",
+                    label="DROPPED_FROM_UNIVERSE",
+                    log_level="warning",
                 )
         for address in list(self.cvd):
             if address not in candidates:
@@ -425,6 +492,7 @@ class Scanner:
         """Map a Birdeye overview response to a candidate model."""
         try:
             symbol = str(data.get("symbol", "?"))
+            name = str(data.get("name", "") or "?")
             market_cap, mc_source = parse_market_cap(data)
             liquidity_raw = data.get("liquidity", data.get("liquidityUsd", 0))
             liquidity = float(liquidity_raw or 0)
@@ -448,6 +516,7 @@ class Scanner:
             liquidity,
             price,
             change,
+            name=name,
             market_cap_source=mc_source,
         )
 
@@ -466,9 +535,15 @@ class Scanner:
         if market_cap <= 0 or liquidity <= 0 or price <= 0:
             return None
         base_token = best.get("baseToken", {})
+        base_dict = base_token if isinstance(base_token, dict) else {}
         symbol = str(
             overview.get("symbol", "")
-            or (base_token.get("symbol", "") if isinstance(base_token, dict) else "")
+            or base_dict.get("symbol", "")
+            or "?"
+        )
+        name = str(
+            overview.get("name", "")
+            or base_dict.get("name", "")
             or "?"
         )
         try:
@@ -482,6 +557,7 @@ class Scanner:
             liquidity,
             price,
             change,
+            name=name,
             market_cap_source=enriched["market_cap_source"] or "dex",
         )
 
@@ -553,26 +629,32 @@ class Scanner:
         position = self.positions.get(token.address)
         if position:
             position.symbol = token.symbol
+            position.name = token.name or position.name
             pnl_pct = (token.price_usd / position.entry_price_usd - 1) * 100
             age = now - position.entry_time
 
             if pnl_pct <= -self.settings.stop_loss_percent:
-                log.warning("EXIT %-10s stop-loss pnl=%+.1f%%", token.symbol, pnl_pct)
-                self.positions.pop(token.address, None)
+                await self._close_position(
+                    token.address, token, token.price_usd,
+                    reason="Stop-loss 🛑", icon="🔴",
+                    label="stop-loss", log_level="warning",
+                )
             elif pnl_pct >= self.settings.take_profit_percent:
-                log.info("EXIT %-10s take-profit pnl=%+.1f%%", token.symbol, pnl_pct)
-                self.positions.pop(token.address, None)
+                await self._close_position(
+                    token.address, token, token.price_usd,
+                    reason="Take-profit 🎯", icon="🟢", label="take-profit",
+                )
             elif state.buy_sell_ratio < 1.0:
                 position.bearish_streak += 1
                 if position.bearish_streak >= self.settings.bearish_exit_confirmations:
-                    log.info(
-                        "EXIT %-10s bearish CVD pnl=%+.1f%% streak=%d/%d",
-                        token.symbol,
-                        pnl_pct,
-                        position.bearish_streak,
-                        self.settings.bearish_exit_confirmations,
+                    await self._close_position(
+                        token.address, token, token.price_usd,
+                        reason="Bearish CVD 📉", icon="🟠",
+                        label=(
+                            f"bearish CVD streak={position.bearish_streak}"
+                            f"/{self.settings.bearish_exit_confirmations}"
+                        ),
                     )
-                    self.positions.pop(token.address, None)
                 else:
                     log.info(
                         "bearish CVD %-10s pnl=%+.1f%% streak=%d/%d (holding)",
@@ -582,8 +664,10 @@ class Scanner:
                         self.settings.bearish_exit_confirmations,
                     )
             elif age >= self.settings.max_hold_seconds:
-                log.info("EXIT %-10s TTL pnl=%+.1f%%", token.symbol, pnl_pct)
-                self.positions.pop(token.address, None)
+                await self._close_position(
+                    token.address, token, token.price_usd,
+                    reason="TTL expired ⏱", icon="🔵", label="TTL",
+                )
             else:
                 position.bearish_streak = 0
             return
@@ -606,12 +690,14 @@ class Scanner:
                     )
                     return
             helius_note = ""
+            confirmed_checked: tuple[int, int] | None = None
             if self.helius is not None and self.settings.helius_verify_wallets:
                 verified = await self._helius_confirmed(
                     token.address, tagged_owners(trader_rows, self.settings.smart_tags)
                 )
                 if verified is not None:
                     confirmed, checked = verified
+                    confirmed_checked = verified
                     helius_note = f" helius={confirmed}/{checked}"
                     if self.settings.helius_require_confirmed and confirmed < 1:
                         log.info(
@@ -619,7 +705,19 @@ class Scanner:
                             token.symbol,
                         )
                         return
-            self.positions[token.address] = PositionState(token.price_usd, now, token.symbol)
+            opened = self.portfolio.try_open(len(self.positions))
+            if not opened.opened:
+                log.info("skip BUY %-10s %s", token.symbol, opened.reason)
+                return
+            self.positions[token.address] = PositionState(
+                token.price_usd,
+                now,
+                token.symbol,
+                name=token.name,
+                notional_usd=opened.notional_usd,
+                balance_before_open_usd=opened.balance_before_usd,
+                balance_after_open_usd=opened.balance_after_usd,
+            )
             log.warning(
                 "BUY SIGNAL %-10s price[%s]=$%.8f smart=%d smart_buy%%=%.0f CVD=$%+.0f ratio=%.2fx%s%s",
                 token.symbol,
@@ -632,6 +730,45 @@ class Scanner:
                 f" cluster={cluster_wallets}" if cluster_wallets is not None else "",
                 helius_note,
             )
+            if self.notifier.enabled:
+                extra: list[str] = []
+                if cluster_wallets is not None:
+                    extra.append(f"🔗 Cluster: {cluster_wallets} tracked wallets")
+                if confirmed_checked is not None:
+                    extra.append(
+                        f"✅ Helius buys: {confirmed_checked[0]}/{confirmed_checked[1]} wallets"
+                    )
+                risk_line = ""
+                if token.risk_score is not None:
+                    flags = f" [{', '.join(token.risk_flags)}]" if token.risk_flags else ""
+                    risk_line = f"Score {token.risk_score}{flags}"
+                await self.notifier.send_open(
+                    OpenAlert(
+                        symbol=token.symbol,
+                        name=token.name or "?",
+                        address=token.address,
+                        entry_price_usd=token.price_usd,
+                        price_source=token.price_source,
+                        notional_usd=opened.notional_usd,
+                        balance_before_usd=opened.balance_before_usd,
+                        balance_after_usd=opened.balance_after_usd,
+                        open_positions=len(self.positions),
+                        max_open_positions=self.settings.max_open_positions,
+                        smart_wallets=smart.tagged_wallets,
+                        smart_buy_pct=smart.buy_ratio * 100,
+                        cvd_usd=state.cvd_usd,
+                        cvd_ratio=state.buy_sell_ratio,
+                        age_text=self._fmt_age(token),
+                        risk_text=risk_line,
+                        top10_text=(
+                            f"{token.top10_holder_pct:.1f}% of supply"
+                            if token.top10_holder_pct is not None
+                            else ""
+                        ),
+                        extra_notes=tuple(extra),
+                        timestamp=now,
+                    )
+                )
 
     async def _jupiter_price_usd(self, address: str) -> float | None:
         """Return a fresh Jupiter quote, or None when unavailable."""
@@ -642,6 +779,24 @@ class Scanner:
 
     async def run(self) -> None:
         """Run discovery and monitoring until interrupted."""
+        if not self._startup_sent:
+            self._startup_sent = True
+            if self.notifier.enabled:
+                settings = self.settings
+                await self.notifier.send_startup(
+                    StartupAlert(
+                        start_balance_usd=settings.paper_start_balance_usd,
+                        position_size_usd=settings.paper_position_size_usd,
+                        max_open_positions=settings.max_open_positions,
+                        max_watched_tokens=settings.max_watched_tokens,
+                        detail_lines=(
+                            f"🧠 Smart ≥{settings.min_smart_wallets} wallets @ ≥{settings.min_smart_buy_ratio * 100:.0f}% buys",
+                            f"📈 CVD ≥{settings.cvd_min_buy_sell_ratio:.2f}x over {settings.cvd_window_seconds // 60}m",
+                            f"🕰 Age ≤{settings.max_token_age_hours}h | 🛡 Rug score ≤{settings.rugcheck_max_score}",
+                            f"🛑 SL {settings.stop_loss_percent:.0f}% | 🎯 TP {settings.take_profit_percent:.0f}%",
+                        ),
+                    )
+                )
         while True:
             now = time.time()
             if now - self.last_discovery >= self.settings.discovery_interval_seconds:

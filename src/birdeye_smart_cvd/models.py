@@ -15,6 +15,8 @@ class TokenCandidate:
     liquidity_usd: float
     price_usd: float
     price_change_24h_pct: float
+    # Display name from the overview (may be "?" when unavailable).
+    name: str = "?"
     # Which overview field the market-cap value came from
     # (e.g. "marketCap", "marketcap", "fdv"). Empty when unknown.
     market_cap_source: str = ""
@@ -78,3 +80,8 @@ class PositionState:
     symbol: str = "?"
     # Consecutive polls with bearish CVD; reset on non-bearish polls.
     bearish_streak: int = 0
+    # Paper accounting snapshot taken at open.
+    name: str = "?"
+    notional_usd: float = 0.0
+    balance_before_open_usd: float = 0.0
+    balance_after_open_usd: float = 0.0

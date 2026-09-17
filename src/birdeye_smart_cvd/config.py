@@ -133,6 +133,16 @@ class Settings:
     helius_verify_window_hours: int = 24
     helius_verify_limit: int = 10
 
+    # Telegram paper alerts. Inert unless token + chat are both set.
+    telegram_enabled: bool = True
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
+    # Paper portfolio: cash accounting for open/close alerts.
+    paper_start_balance_usd: float = 1000.0
+    paper_position_size_usd: float = 100.0
+    max_open_positions: int = 3
+
     @classmethod
     def from_env(cls) -> "Settings":
         """Build settings from environment variables and validate them."""
@@ -210,6 +220,12 @@ class Settings:
             helius_require_confirmed=_bool("HELIUS_REQUIRE_CONFIRMED", False),
             helius_verify_window_hours=_int("HELIUS_VERIFY_WINDOW_HOURS", 24),
             helius_verify_limit=_int("HELIUS_VERIFY_LIMIT", 10),
+            telegram_enabled=_bool("TELEGRAM_ENABLED", True),
+            telegram_bot_token=(_raw("TELEGRAM_BOT_TOKEN") or ""),
+            telegram_chat_id=(_raw("TELEGRAM_CHAT_ID") or ""),
+            paper_start_balance_usd=_float("PAPER_START_BALANCE_USD", 1000.0),
+            paper_position_size_usd=_float("PAPER_POSITION_SIZE_USD", 100.0),
+            max_open_positions=_int("MAX_OPEN_POSITIONS", 3),
         )
 
         if settings.chain != "solana":
@@ -236,6 +252,12 @@ class Settings:
             raise ValueError("HELIUS_VERIFY_WINDOW_HOURS must be >= 1")
         if not 1 <= settings.helius_verify_limit <= 100:
             raise ValueError("HELIUS_VERIFY_LIMIT must be between 1 and 100")
+        if settings.paper_start_balance_usd <= 0:
+            raise ValueError("PAPER_START_BALANCE_USD must be > 0")
+        if settings.paper_position_size_usd <= 0:
+            raise ValueError("PAPER_POSITION_SIZE_USD must be > 0")
+        if settings.max_open_positions < 1:
+            raise ValueError("MAX_OPEN_POSITIONS must be >= 1")
         for name, interval in (
             ("DEXSCREENER_MIN_REQUEST_INTERVAL_SECONDS", settings.dexscreener_min_request_interval_seconds),
             ("JUPITER_MIN_REQUEST_INTERVAL_SECONDS", settings.jupiter_min_request_interval_seconds),

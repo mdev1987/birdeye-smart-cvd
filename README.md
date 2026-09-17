@@ -50,6 +50,29 @@ uv run birdeye-scanner
 
 No transaction is sent. `PositionState` is local paper state only.
 
+## Telegram alerts
+
+Open/close/startup alerts go out via `python-telegram-bot`, rendered with
+`telegramify-markdown` (MarkdownV2, icons, full contract address in a code
+block — never truncated).
+
+```bash
+# in .env
+TELEGRAM_BOT_TOKEN=123456:ABC...   # from @BotFather
+TELEGRAM_CHAT_ID=123456789          # message the bot, then getUpdates
+```
+
+OPEN 🟢 reports entry price + source, size, balance before → after, open
+positions, smart/CVD stats, age, risk, cluster/Helius notes. CLOSE
+(🛑/🎯/📉/⏱/🗑) reports exit price, PnL $ + %, hold time, balance before →
+after, realized total, win rate and open positions. Without both vars the
+notifier stays inert (logged) and the scanner runs normally.
+
+Paper accounting (`paper.py`): cash starts at `PAPER_START_BALANCE_USD`,
+each open reserves `PAPER_POSITION_SIZE_USD`, closes settle
+`size × exit/entry`. `MAX_OPEN_POSITIONS` (default 3) and insufficient
+funds both veto entries with a log line.
+
 ## Notes
 
 - The published Standard package is free, includes 30,000 CU, and is limited to 1 RPS.
