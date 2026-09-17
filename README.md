@@ -39,12 +39,15 @@ Trending candidates (Birdeye)
     -> EXIT DROPPED_FROM_UNIVERSE when a holding leaves discovery
 ```
 
-Profit protection follows the playbook risk rules (scale out instead of
-round-tripping): TP1 banks half at +50%, TP2 banks half of the remainder
-at +100%, a trailing stop (armed +20%, trails 30% from peak, latched)
-locks parabolic runners, and positions die immediately when the tape goes
-quiet (`VOLUME_DEATH_QUIET_POLLS` polls with zero new trades). One scaled
-exit counts as one trade in win rate; partials only move cash + realized.
+Profit protection follows the playbook Early Meme risk rules (50% at x2,
+30% at x3, 20% moonbag): TP1 banks half at +100%, TP2 banks 60% of the
+remainder at +200%, a wide trailing stop (armed +50%, trails 40% from
+peak, latched) only catches genuine round-trips while bearish CVD and
+volume-death exits do the real work, and positions die immediately when
+the tape goes quiet (`VOLUME_DEATH_QUIET_POLLS` polls with zero new
+trades). Paper size is 1% (`PAPER_POSITION_SIZE_USD=10` on 1000). One
+scaled exit counts as one trade in win rate; partials only move cash +
+realized.
 Every entry, TP1 scale-out, and final exit also carries a 🧪 Jupiter
 simulate-only note (route OK? executable fill vs signal? impact?
 simulate CU?) — quote + assemble + local throwaway sign + simulate,

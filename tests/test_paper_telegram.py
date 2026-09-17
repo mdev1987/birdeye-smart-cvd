@@ -340,6 +340,7 @@ class ScannerAlertFlowTests(unittest.IsolatedAsyncioTestCase):
             await scanner.aclose()
 
     async def test_tp_ladder_scales_out_then_runner_wins(self):
+        # Playbook ladder: 50% at x2, 30% at x3, 20% moonbag runner.
         settings = Settings(api_key="x")
         notices = FakeNotifier()
         fake = FakeBirdeye()
@@ -351,34 +352,34 @@ class ScannerAlertFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(token.address, scanner.positions)
 
             fake.trades = []
-            token.price_usd = 1.6  # +60% -> TP1 banks half
+            token.price_usd = 2.0  # +100% -> TP1 banks half
             await scanner.poll_token(token)
             position = scanner.positions.get(token.address)
             self.assertIsNotNone(position)
             assert position is not None
             self.assertTrue(position.tp1_done)
             self.assertAlmostEqual(position.remaining_notional_usd, 50.0)
-            self.assertAlmostEqual(position.realized_pnl_usd, 30.0)
+            self.assertAlmostEqual(position.realized_pnl_usd, 50.0)
             # Partial never counts as a trade.
             self.assertEqual((scanner.portfolio.wins, scanner.portfolio.losses), (0, 0))
             kinds = [k for k, _ in notices.sent]
             self.assertEqual(kinds, ["open", "close"])
             self.assertIn("TP1", notices.sent[1][1].reason)
 
-            token.price_usd = 2.1  # +110% -> TP2 banks half of remainder
+            token.price_usd = 3.0  # +200% -> TP2 banks 60% of remainder
             await scanner.poll_token(token)
             position = scanner.positions.get(token.address)
             assert position is not None
             self.assertTrue(position.tp2_done)
-            self.assertAlmostEqual(position.remaining_notional_usd, 25.0)
-            self.assertAlmostEqual(position.realized_pnl_usd, 57.5)
+            self.assertAlmostEqual(position.remaining_notional_usd, 20.0)
+            self.assertAlmostEqual(position.realized_pnl_usd, 110.0)
 
             token.price_usd = 0.5  # -50% -> stop-loss on the runner
             await scanner.poll_token(token)
             self.assertNotIn(token.address, scanner.positions)
-            # Banked +30 +27.5 outweighs the -12.5 runner: one win overall.
+            # Banked +50 +60 outweighs the -10 runner: one win overall.
             self.assertEqual((scanner.portfolio.wins, scanner.portfolio.losses), (1, 0))
-            self.assertAlmostEqual(scanner.portfolio.realized_pnl_usd, 45.0)
+            self.assertAlmostEqual(scanner.portfolio.realized_pnl_usd, 100.0)
         finally:
             await scanner.aclose()
 
@@ -393,11 +394,11 @@ class ScannerAlertFlowTests(unittest.IsolatedAsyncioTestCase):
             await scanner.poll_token(token)  # entry @ 1.0
 
             fake.trades = []
-            token.price_usd = 1.3  # +30%: arms trail, sets peak
+            token.price_usd = 1.6  # +60%: arms trail (arm +50%), sets peak
             await scanner.poll_token(token)
             self.assertIn(token.address, scanner.positions)
 
-            token.price_usd = 0.9  # -10% pnl but -31% from peak -> trail fires
+            token.price_usd = 0.9  # -10% pnl but -44% from peak -> trail fires
             await scanner.poll_token(token)
             self.assertNotIn(token.address, scanner.positions)
             _kind, close_alert = notices.sent[-1]

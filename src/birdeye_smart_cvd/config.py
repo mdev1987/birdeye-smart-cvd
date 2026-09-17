@@ -96,19 +96,21 @@ class Settings:
     # Simple signal lifecycle. These are bot additions, not rules quoted
     # directly from the Birdeye playbook.
     stop_loss_percent: float = 15.0
-    take_profit_percent: float = 50.0
+    take_profit_percent: float = 100.0
     max_hold_seconds: int = 2400
-    # Partial take-profit ladder (playbook risk rules scale out: 50% at x2,
-    # 30% at x3, moonbag runner). TP1 banks TP1_FRACTION of the position at
+    # Partial take-profit ladder (playbook Early Meme risk rules: 50% at x2,
+    # 30% at x3, 20% moonbag). TP1 banks TP1_FRACTION of the position at
     # +TAKE_PROFIT_PERCENT; TP2 banks TP2_FRACTION of the remainder at
     # +TAKE_PROFIT2_PERCENT; the rest rides to bearish/SL/TTL/volume exits.
-    take_profit2_percent: float = 100.0
+    take_profit2_percent: float = 200.0
     tp1_fraction: float = 0.5
-    tp2_fraction: float = 0.5
+    tp2_fraction: float = 0.6
     # Trailing profit lock: once pnl >= TRAIL_ARM_PCT, exit the runner if
-    # price falls TRAIL_STOP_PCT below its post-entry peak. 0 disables.
-    trail_arm_pct: float = 20.0
-    trail_stop_pct: float = 30.0
+    # price falls TRAIL_STOP_PCT below its post-entry peak. Wide by design:
+    # moonbag runners die to bearish CVD / volume, the trail only catches
+    # genuine round-trips. 0 disables.
+    trail_arm_pct: float = 50.0
+    trail_stop_pct: float = 40.0
     # "Exit immediately if volume dies" (playbook): exit after this many
     # consecutive polls with zero new trades. 0 disables.
     volume_death_quiet_polls: int = 6
@@ -237,12 +239,12 @@ class Settings:
             cvd_min_trades=_int("CVD_MIN_TRADES", 10),
             max_price_change_24h_percent=_float("MAX_PRICE_CHANGE_24H_PERCENT", 80),
             stop_loss_percent=_float("STOP_LOSS_PERCENT", 15),
-            take_profit_percent=_float("TAKE_PROFIT_PERCENT", 50),
-            take_profit2_percent=_float("TAKE_PROFIT2_PCT", 100),
+            take_profit_percent=_float("TAKE_PROFIT_PERCENT", 100),
+            take_profit2_percent=_float("TAKE_PROFIT2_PCT", 200),
             tp1_fraction=_float("TP1_FRACTION", 0.5),
-            tp2_fraction=_float("TP2_FRACTION", 0.5),
-            trail_arm_pct=_float("TRAIL_ARM_PCT", 20),
-            trail_stop_pct=_float("TRAIL_STOP_PCT", 30),
+            tp2_fraction=_float("TP2_FRACTION", 0.6),
+            trail_arm_pct=_float("TRAIL_ARM_PCT", 50),
+            trail_stop_pct=_float("TRAIL_STOP_PCT", 40),
             volume_death_quiet_polls=_int("VOLUME_DEATH_QUIET_POLLS", 6),
             entry_max_surge_pct=_float("ENTRY_MAX_SURGE_PCT", 30),
             max_hold_seconds=_int("MAX_HOLD_SECONDS", 2400),

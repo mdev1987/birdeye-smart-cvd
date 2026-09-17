@@ -376,9 +376,10 @@ class LifecycleConfigTests(unittest.TestCase):
 
     def test_ladder_defaults(self):
         s = self._settings()
-        self.assertEqual(s.take_profit2_percent, 100.0)
-        self.assertEqual((s.tp1_fraction, s.tp2_fraction), (0.5, 0.5))
-        self.assertEqual((s.trail_arm_pct, s.trail_stop_pct), (20.0, 30.0))
+        self.assertEqual(s.take_profit_percent, 100.0)
+        self.assertEqual(s.take_profit2_percent, 200.0)
+        self.assertEqual((s.tp1_fraction, s.tp2_fraction), (0.5, 0.6))
+        self.assertEqual((s.trail_arm_pct, s.trail_stop_pct), (50.0, 40.0))
         self.assertEqual(s.volume_death_quiet_polls, 6)
         self.assertEqual(s.entry_max_surge_pct, 30.0)
 
