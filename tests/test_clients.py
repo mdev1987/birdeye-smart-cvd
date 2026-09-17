@@ -74,6 +74,31 @@ class BirdeyeClientTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_trending_paging_params(self):
+        seen = []
+
+        def handler(request):
+            seen.append(dict(request.url.params))
+            return httpx.Response(
+                200, json={"success": True,
+                           "data": {"tokens": [{"address": "A"}], "total": 1000}}
+            )
+
+        client = BirdeyeClient("http://x", "k", min_request_interval=0)
+        _swap_transport(client, handler)
+        try:
+            rows = await client.trending(50, offset=50, interval="24h")
+            self.assertEqual(rows, [{"address": "A"}])
+            self.assertEqual(seen[0]["limit"], "50")
+            self.assertEqual(seen[0]["offset"], "50")
+            self.assertEqual(seen[0]["interval"], "24h")
+            self.assertEqual(seen[0]["sort_by"], "rank")
+            # API max 50 enforced client-side.
+            await client.trending(500)
+            self.assertEqual(seen[1]["limit"], "50")
+        finally:
+            await client.close()
+
 
 class DexScreenerClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_bare_list_and_404(self):

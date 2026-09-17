@@ -352,6 +352,41 @@ def chase_ok(current_price_usd: float, discovery_price_usd: float,
     return surge_pct <= max_surge_pct
 
 
+def trending_row_passes(
+    row: dict[str, Any],
+    *,
+    min_market_cap_usd: float,
+    max_market_cap_usd: float,
+    min_liquidity_usd: float,
+    max_price_change_24h: float,
+) -> bool:
+    """Pre-filter one trending row on its native fields, before any overview.
+
+    The ``/defi/token_trending`` rows already carry ``marketcap``/``fdv``,
+    ``liquidity`` and ``price24hChangePercent`` (per the Birdeye spec), so
+    the universe band can be checked for ~50 rows per 25-CU page instead of
+    paying an overview call per token. Rows with neither marketcap nor fdv
+    cannot be placed in the band and are skipped. Pure function.
+    """
+    mc, _source = parse_market_cap(
+        {
+            "marketCap": row.get("marketCap"),
+            "marketcap": row.get("marketcap"),
+            "fdv": row.get("fdv"),
+            "FDV": row.get("FDV"),
+        }
+    )
+    if not (min_market_cap_usd <= mc <= max_market_cap_usd):
+        return False
+    liquidity = _parse_float(row.get("liquidity")) or 0.0
+    if liquidity < min_liquidity_usd:
+        return False
+    change = _parse_float(row.get("price24hChangePercent")) or 0.0
+    if change > max_price_change_24h:
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Multi-source enrichment: DexScreener ages, Jupiter birth/price, RugCheck
 # verdicts and CabalSpy cluster matches. All pure functions; every network

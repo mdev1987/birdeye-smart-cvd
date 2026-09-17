@@ -116,15 +116,30 @@ class BirdeyeClient:
             return items if isinstance(items, list) else []
         return []
 
-    async def trending(self, limit: int) -> list[dict[str, Any]]:
-        """Return a small ranked Solana trending-token list."""
+    async def trending(
+        self,
+        limit: int,
+        *,
+        offset: int = 0,
+        sort_by: str = "rank",
+        interval: str = "1h",
+    ) -> list[dict[str, Any]]:
+        """Return one page of the ranked Solana trending-token list.
+
+        The ranking holds ~1000 tokens (see ``total``); small caps live
+        deeper than offset 0, so callers paginate. Cost is 25 CU per
+        request regardless of ``limit`` (max 50) — deep pages are the
+        cheapest depth available. Rows natively carry marketcap/fdv,
+        liquidity and 24h change for pre-filtering before any overview.
+        """
         payload = await self.get(
             "/defi/token_trending",
             {
-                "sort_by": "rank",
+                "sort_by": sort_by,
                 "sort_type": "asc",
-                "interval": "1h",
-                "limit": limit,
+                "interval": interval,
+                "limit": min(max(limit, 1), 50),
+                "offset": max(offset, 0),
             },
         )
         return self._items(payload)

@@ -449,7 +449,6 @@ class ScannerAlertFlowTests(unittest.IsolatedAsyncioTestCase):
 
 class FakeSim:
     """Stub JupiterSim: canned route, records calls, never touches network."""
-
     def __init__(self, route_ok=True):
         self.calls = []
         self.route_ok = route_ok
@@ -543,6 +542,83 @@ class SimWiringTests(unittest.IsolatedAsyncioTestCase):
             kinds = [c[0] for c in scanner.jupsim.calls]
             self.assertIn("buy", kinds)
             self.assertIn("sell", kinds)
+        finally:
+            await scanner.aclose()
+
+
+class PagedBirdeye:
+    """Stub trending: mega-cap page 1, one in-band row on full page 2."""
+
+    def __init__(self, page_size=50):
+        self.page_size = page_size
+        self.trending_calls = []
+        self.overview_calls = []
+
+    def _big(self, i):
+        return {"address": f"BIG{i}", "marketcap": 50_000_000 + i,
+                "liquidity": 1_000_000, "price24hChangePercent": 5.0}
+
+    async def trending(self, limit, *, offset=0, sort_by="rank", interval="24h"):
+        self.trending_calls.append((limit, offset, interval))
+        if offset == 0:
+            return [self._big(i) for i in range(self.page_size)]
+        if offset == self.page_size:
+            return ([{"address": "SMALL1", "marketcap": 500_000,
+                      "liquidity": 50_000, "price24hChangePercent": 10.0}]
+                    + [self._big(1000 + i) for i in range(self.page_size - 1)])
+        return []
+
+    async def token_overview(self, address):
+        self.overview_calls.append(address)
+        return {"symbol": "SMALL", "name": "Small Coin", "marketCap": 500_000,
+                "liquidity": 50_000, "price": 0.001,
+                "priceChange24hPercent": 10.0}
+
+
+class DiscoverPaginationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deep_row_found_with_one_overview(self):
+        settings = Settings(
+            api_key="x", candidate_limit=60, trending_page_size=50,
+            trending_max_pages=3, max_watched_tokens=3,
+            dexscreener_enabled=False, jupiter_enabled=False,
+            rugcheck_enabled=False, helius_enabled=False,
+            cabalspy_enabled=False, sim_enabled=False,
+        )
+        notices = FakeNotifier()
+        scanner = Scanner(PagedBirdeye(), settings, notifier=notices)
+        scanner.dex = scanner.jup = scanner.rug = None
+        scanner.cabal = scanner.helius = scanner.jupsim = None
+        try:
+            await scanner.discover()
+            # In-band row on page 2 found; mega-caps never hydrated.
+            self.assertIn("SMALL1", scanner.watched)
+            self.assertEqual(scanner.jupsim, None)
+            stub = scanner.client
+            self.assertEqual(stub.overview_calls, ["SMALL1"])
+            self.assertEqual(len(stub.trending_calls), 2)
+            self.assertEqual(stub.trending_calls[1][1], 50)  # offset paging
+            token = scanner.watched["SMALL1"]
+            self.assertAlmostEqual(token.discovery_price_usd, 0.001)
+        finally:
+            await scanner.aclose()
+
+    async def test_stops_paging_once_watchlist_full(self):
+        settings = Settings(
+            api_key="x", candidate_limit=200, trending_page_size=50,
+            trending_max_pages=5, max_watched_tokens=1,
+            dexscreener_enabled=False, jupiter_enabled=False,
+            rugcheck_enabled=False, helius_enabled=False,
+            cabalspy_enabled=False, sim_enabled=False,
+        )
+        notices = FakeNotifier()
+        scanner = Scanner(PagedBirdeye(), settings, notifier=notices)
+        scanner.dex = scanner.jup = scanner.rug = None
+        scanner.cabal = scanner.helius = scanner.jupsim = None
+        try:
+            await scanner.discover()
+            self.assertEqual(len(scanner.watched), 1)
+            # Watchlist filled from page 2's survivor: no page 3 fetched.
+            self.assertEqual(len(scanner.client.trending_calls), 2)
         finally:
             await scanner.aclose()
 

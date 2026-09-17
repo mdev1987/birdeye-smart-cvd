@@ -66,8 +66,17 @@ class Settings:
 
     discovery_interval_seconds: int = 300
     poll_interval_seconds: int = 30
-    candidate_limit: int = 10
+    # Max trending rows inspected per discovery (across pages).
+    candidate_limit: int = 100
     max_watched_tokens: int = 3
+    # Trending pagination (per Birdeye spec: 25 CU per request whatever the
+    # limit, max 50/page, ~1000 ranked). The old top-10-only view sees mega
+    # caps exclusively; pages of 50 pre-filtered on row-native fields find
+    # in-band tokens deeper in the ranking at the same CU cost per page.
+    # The Early Meme playbook uses the 24H timeframe.
+    trending_page_size: int = 50
+    trending_max_pages: int = 2
+    trending_interval: str = "24h"
 
     # Playbook universe: new/early, low-cap tokens with usable liquidity.
     min_market_cap_usd: float = 60_000
@@ -223,8 +232,11 @@ class Settings:
             api_min_request_interval_seconds=_float("API_MIN_REQUEST_INTERVAL_SECONDS", 1.5),
             discovery_interval_seconds=_int("DISCOVERY_INTERVAL_SECONDS", 300),
             poll_interval_seconds=_int("POLL_INTERVAL_SECONDS", 30),
-            candidate_limit=_int("CANDIDATE_LIMIT", 10),
+            candidate_limit=_int("CANDIDATE_LIMIT", 100),
             max_watched_tokens=_int("MAX_WATCHED_TOKENS", 3),
+            trending_page_size=_int("TRENDING_PAGE_SIZE", 50),
+            trending_max_pages=_int("TRENDING_MAX_PAGES", 2),
+            trending_interval=(_raw("TRENDING_INTERVAL") or "24h").lower(),
             min_market_cap_usd=_float("MIN_MARKET_CAP_USD", 60_000),
             max_market_cap_usd=_float("MAX_MARKET_CAP_USD", 3_000_000),
             min_liquidity_usd=_float("MIN_LIQUIDITY_USD", 10_000),
@@ -317,6 +329,14 @@ class Settings:
             raise ValueError("API_MIN_REQUEST_INTERVAL_SECONDS must be >= 1.0 for Standard 1 RPS")
         if settings.poll_interval_seconds < 5:
             raise ValueError("POLL_INTERVAL_SECONDS must be >= 5 for the free 1 RPS tier")
+        if not 1 <= settings.candidate_limit <= 1000:
+            raise ValueError("CANDIDATE_LIMIT must be between 1 and 1000")
+        if not 1 <= settings.trending_page_size <= 50:
+            raise ValueError("TRENDING_PAGE_SIZE must be between 1 and 50 (API max)")
+        if not 1 <= settings.trending_max_pages <= 20:
+            raise ValueError("TRENDING_MAX_PAGES must be between 1 and 20")
+        if settings.trending_interval not in {"1h", "4h", "24h"}:
+            raise ValueError("TRENDING_INTERVAL must be one of: 1h, 4h, 24h")
         if settings.min_market_cap_usd >= settings.max_market_cap_usd:
             raise ValueError("MIN_MARKET_CAP_USD must be below MAX_MARKET_CAP_USD")
         if settings.max_watched_tokens < 1:

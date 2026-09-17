@@ -36,6 +36,7 @@ from .strategy import (
     smart_money_stats,
     tagged_owners,
     top_holder_pct,
+    trending_row_passes,
 )
 from .telegram import CloseAlert, OpenAlert, StartupAlert, TelegramNotifier
 
@@ -372,77 +373,138 @@ class Scanner:
         )
         return False
 
+    async def _vet_row(self, address: str, stats: dict[str, int]) -> TokenCandidate | None:
+        """Run one row survivor through overview, enrichment and all gates.
+
+        Returns the candidate when it survives everything, else None.
+        ``stats`` counts base/gated rejections for the discovery summary.
+        """
+        try:
+            overview = await self.client.token_overview(address)
+        except BirdeyeError as exc:
+            log.warning("overview failed %s: %s", address[:8], exc)
+            return None
+
+        # Free keyless enrichment (never billed, fail-open). Fetched
+        # up front: age resolution and overview-gap filling both need it.
+        dex_pairs = await self._dex_pairs(address)
+        jup_entry = await self._jupiter_entry(address)
+
+        candidate = self._candidate_from_overview(address, overview)
+        if candidate is None and dex_pairs:
+            # Birdeye overview incomplete: try the DexScreener best
+            # pair as a fallback so one missing field does not drop
+            # an otherwise valid early token.
+            candidate = self._candidate_from_dex(address, overview, dex_pairs)
+            if candidate is not None:
+                log.info(
+                    "enriched %-10s from DexScreener (Birdeye overview incomplete)",
+                    candidate.symbol,
+                )
+        if candidate is None:
+            stats["base"] += 1
+            return None
+        if candidate.liquidity_usd < self.settings.min_liquidity_usd:
+            stats["base"] += 1
+            return None
+        if not self.settings.min_market_cap_usd <= candidate.market_cap_usd <= self.settings.max_market_cap_usd:
+            stats["base"] += 1
+            return None
+        if candidate.price_change_24h_pct > self.settings.max_price_change_24h_percent:
+            stats["base"] += 1
+            return None
+        if self.settings.enforce_token_age:
+            age_hours, age_source = await self._resolve_age(address, dex_pairs, jup_entry)
+            if not self._apply_age_gate(candidate, age_hours, age_source):
+                stats["gated"] += 1
+                log.info(
+                    "skip %-10s age=%s exceeds %dh",
+                    candidate.symbol,
+                    self._fmt_age(candidate),
+                    self.settings.max_token_age_hours,
+                )
+                return None
+        if self.settings.use_risk_checks and self.settings.rugcheck_enabled:
+            if not await self._rugcheck_ok(candidate):
+                stats["gated"] += 1
+                return None
+        if self.settings.use_risk_checks and not await self._helius_concentration(candidate):
+            stats["gated"] += 1
+            return None
+
+        # Freeze the discovery price: the entry chase guard compares
+        # the live poll price against this snapshot.
+        candidate.discovery_price_usd = candidate.price_usd
+        return candidate
+
     async def discover(self) -> None:
-        """Discover a small candidate universe from Birdeye Trending."""
-        rows = await self.client.trending(self.settings.candidate_limit)
+        """Discover a small candidate universe from Birdeye Trending.
+
+        Pages through the ranking (spec: ~1000 ranked, 25 CU per page
+        whatever the limit) and pre-filters rows on their native
+        marketcap/fdv + liquidity + 24h-change fields. Only survivors pay
+        for overview + enrichment calls. Paging continues until the
+        watchlist itself is full — survivors that die at age/risk gates
+        do not stop the search — or the inspection cap, page cap, or a
+        short page ends it.
+        """
+        settings = self.settings
         candidates: dict[str, TokenCandidate] = {}
-        base_filtered = 0
-        gated_filtered = 0
-
-        for row in rows:
-            address = str(row.get("address", row.get("token", "")))
-            if not address:
-                continue
-
+        stats = {"base": 0, "gated": 0}
+        scanned = 0
+        inspected = 0
+        pages = 0
+        offset = 0
+        while (
+            inspected < settings.candidate_limit
+            and pages < settings.trending_max_pages
+            and len(candidates) < settings.max_watched_tokens
+        ):
             try:
-                overview = await self.client.token_overview(address)
+                page = await self.client.trending(
+                    settings.trending_page_size,
+                    offset=offset,
+                    interval=settings.trending_interval,
+                )
             except BirdeyeError as exc:
-                log.warning("overview failed %s: %s", address[:8], exc)
-                continue
-
-            # Free keyless enrichment (never billed, fail-open). Fetched
-            # up front: age resolution and overview-gap filling both need it.
-            dex_pairs = await self._dex_pairs(address)
-            jup_entry = await self._jupiter_entry(address)
-
-            candidate = self._candidate_from_overview(address, overview)
-            if candidate is None and dex_pairs:
-                # Birdeye overview incomplete: try the DexScreener best
-                # pair as a fallback so one missing field does not drop
-                # an otherwise valid early token.
-                candidate = self._candidate_from_dex(address, overview, dex_pairs)
-                if candidate is not None:
-                    log.info(
-                        "enriched %-10s from DexScreener (Birdeye overview incomplete)",
-                        candidate.symbol,
-                    )
-            if candidate is None:
-                base_filtered += 1
-                continue
-            if candidate.liquidity_usd < self.settings.min_liquidity_usd:
-                base_filtered += 1
-                continue
-            if not self.settings.min_market_cap_usd <= candidate.market_cap_usd <= self.settings.max_market_cap_usd:
-                base_filtered += 1
-                continue
-            if candidate.price_change_24h_pct > self.settings.max_price_change_24h_percent:
-                base_filtered += 1
-                continue
-            if self.settings.enforce_token_age:
-                age_hours, age_source = await self._resolve_age(address, dex_pairs, jup_entry)
-                if not self._apply_age_gate(candidate, age_hours, age_source):
-                    gated_filtered += 1
-                    log.info(
-                        "skip %-10s age=%s exceeds %dh",
-                        candidate.symbol,
-                        self._fmt_age(candidate),
-                        self.settings.max_token_age_hours,
-                    )
-                    continue
-            if self.settings.use_risk_checks and self.settings.rugcheck_enabled:
-                if not await self._rugcheck_ok(candidate):
-                    gated_filtered += 1
-                    continue
-            if self.settings.use_risk_checks and not await self._helius_concentration(candidate):
-                gated_filtered += 1
-                continue
-
-            # Freeze the discovery price: the entry chase guard compares
-            # the live poll price against this snapshot.
-            candidate.discovery_price_usd = candidate.price_usd
-            candidates[address] = candidate
-            if len(candidates) >= self.settings.max_watched_tokens:
+                log.warning("trending page %d failed: %s", pages, exc)
                 break
+            pages += 1
+            if not page:
+                break
+            scanned += len(page)
+            offset += len(page)
+            for row in page:
+                if (
+                    inspected >= settings.candidate_limit
+                    or len(candidates) >= settings.max_watched_tokens
+                ):
+                    break
+                inspected += 1
+                if not isinstance(row, dict):
+                    stats["base"] += 1
+                    continue
+                address = str(row.get("address", row.get("token", "")))
+                if not address:
+                    stats["base"] += 1
+                    continue
+                # Row-native universe check first: skips mega-caps without
+                # spending an overview call on them.
+                if not trending_row_passes(
+                    row,
+                    min_market_cap_usd=settings.min_market_cap_usd,
+                    max_market_cap_usd=settings.max_market_cap_usd,
+                    min_liquidity_usd=settings.min_liquidity_usd,
+                    max_price_change_24h=settings.max_price_change_24h_percent,
+                ):
+                    stats["base"] += 1
+                    continue
+                candidate = await self._vet_row(address, stats)
+                if candidate is None:
+                    continue
+                candidates[address] = candidate
+            if len(page) < settings.trending_page_size:
+                break  # short page: ranking exhausted
 
         await self._retire_dropped(candidates)
         self.watched = candidates
@@ -451,11 +513,12 @@ class Scanner:
 
         self.last_discovery = time.time()
         log.info(
-            "discovered %d candidates (%d trending, %d base-filtered, %d age/risk-filtered) [mode=%s]",
+            "discovered %d candidates (%d rows/%d pages, %d base-filtered, %d age/risk-filtered) [mode=%s]",
             len(self.watched),
-            len(rows),
-            base_filtered,
-            gated_filtered,
+            scanned,
+            pages,
+            stats["base"],
+            stats["gated"],
             self.settings.scanner_mode.upper(),
         )
         for token in self.watched.values():

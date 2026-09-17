@@ -278,6 +278,55 @@ class CreationUnixTests(unittest.TestCase):
         self.assertIsNone(parse_creation_unix({}))
 
 
+class TrendingRowTests(unittest.TestCase):
+    def _args(self, **over):
+        kw = {
+            "min_market_cap_usd": 60_000,
+            "max_market_cap_usd": 3_000_000,
+            "min_liquidity_usd": 10_000,
+            "max_price_change_24h": 80.0,
+        }
+        kw.update(over)
+        return kw
+
+    def test_in_band_row_passes(self):
+        from birdeye_smart_cvd.strategy import trending_row_passes
+
+        row = {"marketcap": 500_000, "liquidity": 50_000,
+               "price24hChangePercent": 12.0}
+        self.assertTrue(trending_row_passes(row, **self._args()))
+
+    def test_fdv_fallback(self):
+        from birdeye_smart_cvd.strategy import trending_row_passes
+
+        row = {"fdv": 482_000, "liquidity": 20_000,
+               "price24hChangePercent": -5.0}
+        self.assertTrue(trending_row_passes(row, **self._args()))
+
+    def test_each_gate_blocks(self):
+        from birdeye_smart_cvd.strategy import trending_row_passes
+
+        base = {"marketcap": 500_000, "liquidity": 50_000,
+                "price24hChangePercent": 5.0}
+        self.assertFalse(trending_row_passes(
+            {**base, "marketcap": 5_000_000}, **self._args()))
+        self.assertFalse(trending_row_passes(
+            {**base, "liquidity": 500}, **self._args()))
+        self.assertFalse(trending_row_passes(
+            {**base, "price24hChangePercent": 81.0}, **self._args()))
+        # No marketcap and no fdv: unplaceable in the band.
+        self.assertFalse(trending_row_passes(
+            {"liquidity": 50_000, "price24hChangePercent": 5.0},
+            **self._args()))
+
+    def test_zero_mc_rejected(self):
+        from birdeye_smart_cvd.strategy import trending_row_passes
+
+        row = {"marketcap": 0, "fdv": 0, "liquidity": 50_000,
+               "price24hChangePercent": 1.0}
+        self.assertFalse(trending_row_passes(row, **self._args()))
+
+
 class StrategyNameTests(unittest.TestCase):
     def test_canonical_name_says_proxy(self):
         from birdeye_smart_cvd.strategy import STRATEGY_NAME
@@ -425,6 +474,28 @@ class SimConfigTests(unittest.TestCase):
             self._settings(SIM_SLIPPAGE_BPS="20000")
         with self.assertRaises(ValueError):
             self._settings(JUPITER_ORDER_TIMEOUT_S="0")
+
+
+class TrendingConfigTests(unittest.TestCase):
+    def _settings(self, **env):
+        return _settings_from_mock_env(**env)
+
+    def test_trending_defaults(self):
+        s = self._settings()
+        self.assertEqual(s.trending_page_size, 50)
+        self.assertEqual(s.trending_max_pages, 2)
+        self.assertEqual(s.trending_interval, "24h")
+        self.assertEqual(s.candidate_limit, 100)
+
+    def test_trending_validation(self):
+        with self.assertRaises(ValueError):
+            self._settings(TRENDING_PAGE_SIZE="51")
+        with self.assertRaises(ValueError):
+            self._settings(TRENDING_MAX_PAGES="0")
+        with self.assertRaises(ValueError):
+            self._settings(TRENDING_INTERVAL="7d")
+        s = self._settings(TRENDING_INTERVAL="4H")
+        self.assertEqual(s.trending_interval, "4h")
 
 
 if __name__ == "__main__":

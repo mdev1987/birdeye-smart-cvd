@@ -15,10 +15,19 @@ ENRICHED  RISK + Jupiter + DexScreener + CabalSpy   (default, full pipeline)
 ```
 
 Run `CORE` first to test whether the raw strategy has edge before risk
-filters and enrichment influence the result. `CORE` makes no
-Jupiter/DexScreener/RugCheck/Helius/CabalSpy calls at all, which also
-keeps discovery cheap on the 1-RPS Birdeye tier. Telegram alerting is
+filters and enrichment influence the result. Telegram alerting is
 orthogonal and fires in every mode when configured.
+
+## Discovery: paged trending, not top-10
+
+Per the Birdeye spec, `/defi/token_trending` holds ~1000 ranked tokens at
+25 CU per request *whatever the limit*, and each row already carries
+`marketcap`/`fdv`, `liquidity` and `price24hChangePercent`. So discovery
+pages through the ranking (`TRENDING_PAGE_SIZE=50`, `TRENDING_MAX_PAGES=2`,
+`TRENDING_INTERVAL=24h` per the Early Meme timeframe), pre-filters rows on
+their native fields, and only survivors pay for overview + enrichment —
+stopping early once the watchlist is full. Reading only offset 0–10 sees
+mega-caps exclusively; the in-band tokens live deeper in the ranking.
 
 ## Strategy
 
