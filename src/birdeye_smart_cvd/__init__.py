@@ -1,1 +1,1 @@
-"""Birdeye Smart Money + CVD signal scanner."""
+"""Birdeye Smart-Money Proxy + 15m CVD signal scanner."""

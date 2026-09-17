@@ -14,6 +14,13 @@ import httpx
 from .ratelimit import AsyncRateLimiter
 
 
+def _redact(text: str) -> str:
+    """Scrub an embedded Helius key so errors are safe for daemon logs."""
+    import re
+
+    return re.sub(r"api-key=[^&\s'\"]*", "api-key=***", text)
+
+
 class HeliusError(RuntimeError):
     """Raised when Helius returns an error or unusable payload."""
 
@@ -46,6 +53,9 @@ class HeliusClient:
         )
         self._limiter = AsyncRateLimiter(min_request_interval)
         self._verify_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        # Mint decimals never change: cache successes forever to avoid
+        # re-paying an RPC call per signal on the same token.
+        self._decimals_cache: dict[str, int] = {}
 
     async def __aenter__(self) -> "HeliusClient":
         """Enter the async client context."""
@@ -68,7 +78,7 @@ class HeliusClient:
                 response = await self._client.post("", json=body)
             except httpx.HTTPError as exc:
                 self._limiter.mark()
-                raise HeliusError(f"network error: {exc}") from exc
+                raise HeliusError(f"network error: {_redact(str(exc))}") from exc
             self._limiter.mark()
 
             if response.status_code == 401:
@@ -79,7 +89,7 @@ class HeliusClient:
                 raise HeliusError("HTTP 429: Helius rate limit exceeded")
             if response.status_code >= 400:
                 raise HeliusError(
-                    f"HTTP {response.status_code}: {response.text[:300]}"
+                    f"HTTP {response.status_code}: {_redact(response.text[:300])}"
                 )
             try:
                 payload = response.json()
@@ -89,8 +99,30 @@ class HeliusClient:
             if not isinstance(payload, dict):
                 raise HeliusError(f"unexpected Helius payload: {type(payload)}")
             if payload.get("error"):
-                raise HeliusError(f"Helius RPC error: {payload['error']}")
+                raise HeliusError(f"Helius RPC error: {_redact(str(payload['error']))}")
             return payload.get("result")
+
+    async def token_decimals(self, mint: str, commitment: str = "confirmed") -> int | None:
+        """Return a mint's decimals via parsed getAccountInfo, cached forever."""
+        cached = self._decimals_cache.get(mint)
+        if cached is not None:
+            return cached
+        result = await self.rpc(
+            "getAccountInfo",
+            [mint, {"encoding": "jsonParsed", "commitment": commitment}],
+        )
+        decimals: int | None = None
+        if isinstance(result, dict):
+            value = result.get("value", {})
+            data = value.get("data", {}) if isinstance(value, dict) else {}
+            parsed = data.get("parsed", {}) if isinstance(data, dict) else {}
+            info = parsed.get("info", {}) if isinstance(parsed, dict) else {}
+            raw = info.get("decimals") if isinstance(info, dict) else None
+            if isinstance(raw, int) and 0 <= raw <= 18:
+                decimals = raw
+        if decimals is not None:
+            self._decimals_cache[mint] = decimals
+        return decimals
 
     async def largest_accounts(self, mint: str, commitment: str = "confirmed") -> list[dict[str, Any]]:
         """Return largest token accounts for a mint (may be empty)."""
@@ -130,27 +162,31 @@ class HeliusClient:
         *,
         limit: int = 10,
         commitment: str = "confirmed",
+        since_unix: int | None = None,
     ) -> list[dict[str, Any]]:
         """Return recent inbound transfers of ``mint`` to ``wallet``.
 
         Results are cached per (wallet, mint) for the session: buys only
         accumulate, so a cached hit stays valid as advisory confirmation.
+        When ``since_unix`` is given it is pushed server-side as
+        ``filters.blockTime.gte`` (per Helius docs) so stale rows never
+        cross the wire; callers still filter client-side as a backstop.
         """
         cache_key = (wallet, mint)
         cached = self._verify_cache.get(cache_key)
         if cached is not None:
             return cached
-        result = await self.rpc(
-            "getTransfersByAddress",
-            {
-                "address": wallet,
-                "mint": mint,
-                "direction": "in",
-                "limit": min(max(limit, 1), 100),
-                "commitment": commitment,
-                "sortOrder": "desc",
-            },
-        )
+        options: dict[str, Any] = {
+            "address": wallet,
+            "mint": mint,
+            "direction": "in",
+            "limit": min(max(limit, 1), 100),
+            "commitment": commitment,
+            "sortOrder": "desc",
+        }
+        if since_unix is not None and since_unix > 0:
+            options["filters"] = {"blockTime": {"gte": int(since_unix)}}
+        result = await self.rpc("getTransfersByAddress", options)
         items: list[dict[str, Any]] = []
         if isinstance(result, dict):
             data = result.get("data", result.get("transfers", []))

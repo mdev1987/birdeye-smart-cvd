@@ -45,6 +45,8 @@ class RollingCVDTests(unittest.TestCase):
         )
         self.assertEqual(state.cvd_usd, 60.0)
         self.assertAlmostEqual(state.buy_sell_ratio, 2.5)
+        self.assertEqual(state.trade_count, 2)
+        self.assertEqual(state.total_volume_usd, 140.0)
 
     def test_removes_expired_trades(self):
         r = RollingCVD(900)
@@ -52,6 +54,22 @@ class RollingCVDTests(unittest.TestCase):
         state = r.add([], now=2000)  # cutoff 1100, trade at 1000 expires
         self.assertEqual(state.buy_volume_usd, 0.0)
         self.assertEqual(len(r.points), 0)
+        self.assertEqual(state.trade_count, 0)
+        self.assertEqual(state.total_volume_usd, 0.0)
+
+    def test_partial_expiry_updates_count(self):
+        r = RollingCVD(900)
+        r.add(
+            [
+                TradePoint("old", 1000, "buy", 50.0),
+                TradePoint("new", 1500, "buy", 1500.0),
+                TradePoint("new2", 1600, "sell", 1000.0),
+            ],
+            now=1600,
+        )
+        state = r.add([], now=2000)  # cutoff 1100: "old" expires
+        self.assertEqual(state.trade_count, 2)
+        self.assertEqual(state.total_volume_usd, 2500.0)
 
     def test_no_double_count(self):
         r = RollingCVD(900)
@@ -94,10 +112,13 @@ class EntryAllowedTests(unittest.TestCase):
         kw = {
             "candidate": _cand(),
             "smart": SmartMoneyStats(2, 60.0, 40.0),
-            "cvd": CVDState(120.0, 100.0),
+            # Healthy sample: $2200 volume over 12 trades, ratio 1.2.
+            "cvd": CVDState(1200.0, 1000.0, trade_count=12),
             "min_smart_wallets": 2,
             "min_smart_buy_ratio": 0.6,
             "min_cvd_ratio": 1.2,
+            "min_cvd_volume_usd": 2000.0,
+            "min_cvd_trades": 10,
             "max_price_change_24h": 80.0,
         }
         kw.update(over)
@@ -116,11 +137,40 @@ class EntryAllowedTests(unittest.TestCase):
             entry_allowed(**self._args(smart=SmartMoneyStats(2, 30.0, 70.0)))
         )
         self.assertFalse(
-            entry_allowed(**self._args(cvd=CVDState(100.0, 100.0)))
+            entry_allowed(**self._args(cvd=CVDState(1000.0, 1000.0, trade_count=12)))
         )
         self.assertFalse(
             entry_allowed(**self._args(candidate=_cand(price_change_24h_pct=81.0)))
         )
+
+    def test_thin_sample_rejected_despite_infinite_ratio(self):
+        # "$2 buy / $0 sells": infinite ratio, but no information.
+        from birdeye_smart_cvd.models import CVDState
+
+        thin = CVDState(2.0, 0.0, trade_count=1)
+        self.assertEqual(thin.buy_sell_ratio, float("inf"))
+        self.assertFalse(entry_allowed(**self._args(cvd=thin)))
+
+    def test_low_volume_blocks(self):
+        from birdeye_smart_cvd.models import CVDState
+
+        # Good ratio (1.5x) and enough trades, but only $300 volume.
+        low_vol = CVDState(180.0, 120.0, trade_count=12)
+        self.assertGreaterEqual(low_vol.buy_sell_ratio, 1.2)
+        self.assertFalse(entry_allowed(**self._args(cvd=low_vol)))
+
+    def test_few_trades_block(self):
+        from birdeye_smart_cvd.models import CVDState
+
+        # Good ratio and volume, but only 3 trades.
+        few = CVDState(1500.0, 1000.0, trade_count=3)
+        self.assertFalse(entry_allowed(**self._args(cvd=few)))
+
+    def test_boundaries_pass(self):
+        from birdeye_smart_cvd.models import CVDState
+
+        exact = CVDState(1200.0, 1000.0, trade_count=10)
+        self.assertTrue(entry_allowed(**self._args(cvd=exact)))
 
 
 class NormalizeTradeTests(unittest.TestCase):
@@ -226,6 +276,154 @@ class CreationUnixTests(unittest.TestCase):
 
     def test_missing(self):
         self.assertIsNone(parse_creation_unix({}))
+
+
+class StrategyNameTests(unittest.TestCase):
+    def test_canonical_name_says_proxy(self):
+        from birdeye_smart_cvd.strategy import STRATEGY_NAME
+
+        self.assertIn("Proxy", STRATEGY_NAME)
+        self.assertIn("CVD", STRATEGY_NAME)
+
+
+class ChaseOkTests(unittest.TestCase):
+    def test_allows_flat_and_dips(self):
+        from birdeye_smart_cvd.strategy import chase_ok
+
+        self.assertTrue(chase_ok(1.0, 1.0, 30.0))
+        self.assertTrue(chase_ok(0.9, 1.0, 30.0))
+
+    def test_blocks_breakout_chase(self):
+        from birdeye_smart_cvd.strategy import chase_ok
+
+        self.assertFalse(chase_ok(1.43, 1.0, 30.0))
+
+    def test_boundary_passes(self):
+        from birdeye_smart_cvd.strategy import chase_ok
+
+        # 1.29-up on 1.0 is safely inside; exact 1.30 flirts with float
+        # dust (0.30000000000000004), so the guard stays strict <=.
+        self.assertTrue(chase_ok(1.29, 1.0, 30.0))
+        self.assertFalse(chase_ok(1.31, 1.0, 30.0))
+
+    def test_zero_disables(self):
+        from birdeye_smart_cvd.strategy import chase_ok
+
+        self.assertTrue(chase_ok(5.0, 1.0, 0))
+
+    def test_missing_snapshot_fails_open(self):
+        from birdeye_smart_cvd.strategy import chase_ok
+
+        self.assertTrue(chase_ok(1.5, 0.0, 30.0))
+        self.assertTrue(chase_ok(0.0, 1.0, 30.0))
+
+
+def _settings_from_mock_env(**env):
+    """Build Settings from a hermetic env (real .env never leaks into tests).
+
+    ``Settings.from_env()`` calls ``load_dotenv()``, which would otherwise
+    refill cleared vars from the developer's real .env file.
+    """
+    import os
+    from unittest import mock
+
+    from birdeye_smart_cvd import config as config_module
+    from birdeye_smart_cvd.config import Settings
+
+    base = {"BIRDEYE_API_KEY": "test-key"}
+    base.update(env)
+    with mock.patch.dict(os.environ, base, clear=True):
+        with mock.patch.object(config_module, "load_dotenv", lambda *a, **k: False):
+            return Settings.from_env()
+
+
+class ScannerModeTests(unittest.TestCase):
+    def _settings(self, **env):
+        return _settings_from_mock_env(**env)
+
+    def test_default_is_enriched(self):
+        s = self._settings()
+        self.assertEqual(s.scanner_mode, "enriched")
+        self.assertTrue(s.use_risk_checks)
+        self.assertTrue(s.use_enrichment)
+
+    def test_core_disables_risk_and_enrichment(self):
+        s = self._settings(SCANNER_MODE="core")
+        self.assertFalse(s.use_risk_checks)
+        self.assertFalse(s.use_enrichment)
+
+    def test_risk_enables_risk_only(self):
+        s = self._settings(SCANNER_MODE="RISK")
+        self.assertEqual(s.scanner_mode, "risk")
+        self.assertTrue(s.use_risk_checks)
+        self.assertFalse(s.use_enrichment)
+
+    def test_invalid_mode_rejected(self):
+        with self.assertRaises(ValueError):
+            self._settings(SCANNER_MODE="full")
+
+    def test_cvd_gates_configurable(self):
+        s = self._settings(CVD_MIN_VOLUME_USD="500", CVD_MIN_TRADES="3")
+        self.assertEqual(s.cvd_min_volume_usd, 500.0)
+        self.assertEqual(s.cvd_min_trades, 3)
+        with self.assertRaises(ValueError):
+            self._settings(CVD_MIN_TRADES="0")
+
+
+class LifecycleConfigTests(unittest.TestCase):
+    def _settings(self, **env):
+        return _settings_from_mock_env(**env)
+
+    def test_ladder_defaults(self):
+        s = self._settings()
+        self.assertEqual(s.take_profit2_percent, 100.0)
+        self.assertEqual((s.tp1_fraction, s.tp2_fraction), (0.5, 0.5))
+        self.assertEqual((s.trail_arm_pct, s.trail_stop_pct), (20.0, 30.0))
+        self.assertEqual(s.volume_death_quiet_polls, 6)
+        self.assertEqual(s.entry_max_surge_pct, 30.0)
+
+    def test_tp2_must_exceed_tp1(self):
+        with self.assertRaises(ValueError):
+            self._settings(TAKE_PROFIT2_PCT="40")
+        with self.assertRaises(ValueError):
+            self._settings(TP1_FRACTION="1.5")
+        with self.assertRaises(ValueError):
+            self._settings(TP2_FRACTION="0")
+
+    def test_disables_allowed(self):
+        s = self._settings(TRAIL_STOP_PCT="0", VOLUME_DEATH_QUIET_POLLS="0",
+                           ENTRY_MAX_SURGE_PCT="0")
+        self.assertEqual(s.trail_stop_pct, 0)
+        self.assertEqual(s.volume_death_quiet_polls, 0)
+        self.assertEqual(s.entry_max_surge_pct, 0)
+
+
+class SimConfigTests(unittest.TestCase):
+    def _settings(self, **env):
+        return _settings_from_mock_env(**env)
+
+    def test_sim_defaults(self):
+        s = self._settings()
+        self.assertTrue(s.sim_enabled)
+        self.assertEqual(s.jupiter_base_url, "https://api.jup.ag")
+        self.assertEqual(s.private_key, "")
+        self.assertEqual(s.jupiter_order_timeout_s, 12.0)
+        self.assertEqual(s.sim_slippage_bps, 300)
+        self.assertEqual(s.sim_max_impact_pct, 5.0)
+        self.assertFalse(s.sim_require_route)
+
+    def test_sim_keys_read(self):
+        s = self._settings(PRIVATE_KEY="abc123", JUPITER_API_KEY="jup_x",
+                           SIM_REQUIRE_ROUTE="true")
+        self.assertEqual(s.private_key, "abc123")
+        self.assertEqual(s.jupiter_api_key, "jup_x")
+        self.assertTrue(s.sim_require_route)
+
+    def test_sim_validation(self):
+        with self.assertRaises(ValueError):
+            self._settings(SIM_SLIPPAGE_BPS="20000")
+        with self.assertRaises(ValueError):
+            self._settings(JUPITER_ORDER_TIMEOUT_S="0")
 
 
 if __name__ == "__main__":

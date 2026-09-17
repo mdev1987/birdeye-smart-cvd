@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from birdeye_smart_cvd.config import Settings  # noqa: E402
+from birdeye_smart_cvd.jupsim import SimResult  # noqa: E402
 from birdeye_smart_cvd.models import TokenCandidate  # noqa: E402
 from birdeye_smart_cvd.paper import PaperPortfolio  # noqa: E402
 from birdeye_smart_cvd.scanner import Scanner  # noqa: E402
@@ -64,6 +65,26 @@ class PortfolioTests(unittest.TestCase):
         self.assertEqual((loss.wins, loss.losses), (1, 1))
         self.assertAlmostEqual(loss.win_rate_pct, 50.0)
         self.assertAlmostEqual(pf.realized_pnl_usd, 0.0)
+
+    def test_close_partial_moves_cash_without_counting(self):
+        pf = PaperPortfolio(1000.0, 100.0, 3)
+        pf.try_open(0)
+        part = pf.close_partial(1.0, 1.5, 50.0)
+        self.assertAlmostEqual(part.pnl_usd, 25.0)
+        self.assertAlmostEqual(part.pnl_pct, 50.0)
+        self.assertEqual((pf.wins, pf.losses), (0, 0))
+        self.assertIsNone(pf.win_rate_pct)
+        self.assertAlmostEqual(pf.realized_pnl_usd, 25.0)
+
+    def test_close_win_override_judges_whole_position(self):
+        pf = PaperPortfolio(1000.0, 100.0, 3)
+        pf.try_open(0)
+        pf.close_partial(1.0, 1.5, 50.0)  # +25 banked
+        # Runner slice loses, but the whole position won overall.
+        final = pf.close(1.0, 0.9, 50.0, win_override=True)
+        self.assertAlmostEqual(final.pnl_usd, -5.0)
+        self.assertEqual((pf.wins, pf.losses), (1, 0))
+        self.assertAlmostEqual(pf.realized_pnl_usd, 20.0)
 
     def test_win_rate_none_before_first_close(self):
         pf = PaperPortfolio(1000.0, 100.0, 3)
@@ -202,14 +223,23 @@ class FakeBirdeye:
         now = int(time.time())
         leg = {"address": address, "price": 1.0}
         other = {"address": "So11111111111111111111111111111111111111112", "price": 100.0}
-        return [
-            {"side": "buy", "volume_usd": 500.0, "block_unix_time": now - 60,
-             "tx_hash": "H1", "ins_index": 0, "inner_ins_index": 0,
-             "from": leg, "to": other},
-            {"side": "sell", "volume_usd": 100.0, "block_unix_time": now - 30,
-             "tx_hash": "H2", "ins_index": 0, "inner_ins_index": 0,
-             "from": other, "to": leg},
-        ]
+        # Healthy CVD sample: 8 x $300 buys ($2400) + 4 x $150 sells ($600)
+        # = $3000 volume over 12 trades at 4.0x ratio, clearing the
+        # default CVD_MIN_VOLUME_USD=2000 / CVD_MIN_TRADES=10 floors.
+        rows = []
+        for i in range(8):
+            rows.append(
+                {"side": "buy", "volume_usd": 300.0, "block_unix_time": now - 120 + i,
+                 "tx_hash": f"BUY{i}", "ins_index": 0, "inner_ins_index": i,
+                 "from": leg, "to": other}
+            )
+        for i in range(4):
+            rows.append(
+                {"side": "sell", "volume_usd": 150.0, "block_unix_time": now - 60 + i,
+                 "tx_hash": f"SELL{i}", "ins_index": 0, "inner_ins_index": i,
+                 "from": other, "to": leg}
+            )
+        return rows
 
 
 class FakeNotifier:
@@ -306,6 +336,212 @@ class ScannerAlertFlowTests(unittest.IsolatedAsyncioTestCase):
             await scanner.poll_token(second)
             self.assertNotIn(second.address, scanner.positions)
             self.assertEqual([k for k, _ in notices.sent], ["open"])
+        finally:
+            await scanner.aclose()
+
+    async def test_tp_ladder_scales_out_then_runner_wins(self):
+        settings = Settings(api_key="x")
+        notices = FakeNotifier()
+        fake = FakeBirdeye()
+        scanner = self._scanner(fake, settings, notices)
+        try:
+            token = _token()
+            self._watch(scanner, token)
+            await scanner.poll_token(token)  # entry @ 1.0
+            self.assertIn(token.address, scanner.positions)
+
+            fake.trades = []
+            token.price_usd = 1.6  # +60% -> TP1 banks half
+            await scanner.poll_token(token)
+            position = scanner.positions.get(token.address)
+            self.assertIsNotNone(position)
+            assert position is not None
+            self.assertTrue(position.tp1_done)
+            self.assertAlmostEqual(position.remaining_notional_usd, 50.0)
+            self.assertAlmostEqual(position.realized_pnl_usd, 30.0)
+            # Partial never counts as a trade.
+            self.assertEqual((scanner.portfolio.wins, scanner.portfolio.losses), (0, 0))
+            kinds = [k for k, _ in notices.sent]
+            self.assertEqual(kinds, ["open", "close"])
+            self.assertIn("TP1", notices.sent[1][1].reason)
+
+            token.price_usd = 2.1  # +110% -> TP2 banks half of remainder
+            await scanner.poll_token(token)
+            position = scanner.positions.get(token.address)
+            assert position is not None
+            self.assertTrue(position.tp2_done)
+            self.assertAlmostEqual(position.remaining_notional_usd, 25.0)
+            self.assertAlmostEqual(position.realized_pnl_usd, 57.5)
+
+            token.price_usd = 0.5  # -50% -> stop-loss on the runner
+            await scanner.poll_token(token)
+            self.assertNotIn(token.address, scanner.positions)
+            # Banked +30 +27.5 outweighs the -12.5 runner: one win overall.
+            self.assertEqual((scanner.portfolio.wins, scanner.portfolio.losses), (1, 0))
+            self.assertAlmostEqual(scanner.portfolio.realized_pnl_usd, 45.0)
+        finally:
+            await scanner.aclose()
+
+    async def test_trailing_stop_locks_peak_profit(self):
+        settings = Settings(api_key="x")
+        notices = FakeNotifier()
+        fake = FakeBirdeye()
+        scanner = self._scanner(fake, settings, notices)
+        try:
+            token = _token()
+            self._watch(scanner, token)
+            await scanner.poll_token(token)  # entry @ 1.0
+
+            fake.trades = []
+            token.price_usd = 1.3  # +30%: arms trail, sets peak
+            await scanner.poll_token(token)
+            self.assertIn(token.address, scanner.positions)
+
+            token.price_usd = 0.9  # -10% pnl but -31% from peak -> trail fires
+            await scanner.poll_token(token)
+            self.assertNotIn(token.address, scanner.positions)
+            _kind, close_alert = notices.sent[-1]
+            self.assertIn("Trailing", close_alert.reason)
+            self.assertAlmostEqual(close_alert.pnl_pct, -10.0)
+        finally:
+            await scanner.aclose()
+
+    async def test_volume_death_exits_quiet_position(self):
+        settings = Settings(api_key="x", volume_death_quiet_polls=3)
+        notices = FakeNotifier()
+        fake = FakeBirdeye()
+        scanner = self._scanner(fake, settings, notices)
+        try:
+            token = _token()
+            self._watch(scanner, token)
+            await scanner.poll_token(token)  # entry @ 1.0
+
+            fake.trades = []
+            for _ in range(3):
+                await scanner.poll_token(token)
+            self.assertNotIn(token.address, scanner.positions)
+            _kind, close_alert = notices.sent[-1]
+            self.assertIn("Volume died", close_alert.reason)
+        finally:
+            await scanner.aclose()
+
+    async def test_chase_guard_skips_runaway_entry(self):
+        settings = Settings(api_key="x")
+        notices = FakeNotifier()
+        scanner = self._scanner(FakeBirdeye(), settings, notices)
+        try:
+            token = _token()
+            token.discovery_price_usd = 0.7  # live 1.0 = +43% past discovery
+            self._watch(scanner, token)
+            await scanner.poll_token(token)
+            self.assertNotIn(token.address, scanner.positions)
+            self.assertEqual(notices.sent, [])
+
+            token2 = _token(symbol="OK", address="OK222")
+            token2.discovery_price_usd = 0.8  # +25% <= 30% guard: allowed
+            self._watch(scanner, token2)
+            await scanner.poll_token(token2)
+            self.assertIn(token2.address, scanner.positions)
+        finally:
+            await scanner.aclose()
+
+
+class FakeSim:
+    """Stub JupiterSim: canned route, records calls, never touches network."""
+
+    def __init__(self, route_ok=True):
+        self.calls = []
+        self.route_ok = route_ok
+
+    async def check_buy(self, mint, notional_usd, *, out_decimals):
+        self.calls.append(("buy", mint, notional_usd))
+        if not self.route_ok:
+            return SimResult(side="buy", reason="no route: empty")
+        return SimResult(side="buy", route_ok=True, sim_ok=True,
+                         effective_price_usd=1.0, quoted_out_ui=100.0,
+                         impact_pct=0.4, units_consumed=41000,
+                         reason="simulated, not broadcast")
+
+    async def check_sell(self, mint, qty_ui, decimals, ref=0.0):
+        self.calls.append(("sell", mint, qty_ui))
+        if not self.route_ok:
+            return SimResult(side="sell", reason="no route: empty")
+        return SimResult(side="sell", route_ok=True, sim_ok=True,
+                         effective_price_usd=0.5, quoted_out_ui=50.0,
+                         impact_pct=0.6, units_consumed=38000,
+                         reason="simulated, not broadcast")
+
+
+class SimWiringTests(unittest.IsolatedAsyncioTestCase):
+    def _scanner(self, fake, settings, notices):
+        scanner = Scanner(fake, settings, notifier=notices)
+        scanner.dex = None
+        scanner.jup = None
+        scanner.rug = None
+        scanner.cabal = None
+        scanner.helius = None
+        return scanner
+
+    def _watch(self, scanner, token):
+        scanner.cvd.setdefault(token.address, RollingCVD(900))
+
+    async def test_buy_note_attached_to_open_alert(self):
+        settings = Settings(api_key="x")
+        notices = FakeNotifier()
+        scanner = self._scanner(FakeBirdeye(), settings, notices)
+        scanner.jupsim = FakeSim()
+        try:
+            token = _token()
+            self._watch(scanner, token)
+            await scanner.poll_token(token)
+            self.assertIn(token.address, scanner.positions)
+            self.assertEqual(scanner.jupsim.calls[0][0], "buy")
+            _kind, open_alert = notices.sent[0]
+            sim_notes = [n for n in open_alert.extra_notes if "Sim buy" in n]
+            self.assertEqual(len(sim_notes), 1)
+            self.assertIn("route OK", sim_notes[0])
+        finally:
+            await scanner.aclose()
+
+    async def test_require_route_blocks_routeless_entry(self):
+        settings = Settings(api_key="x", sim_require_route=True)
+        notices = FakeNotifier()
+        scanner = self._scanner(FakeBirdeye(), settings, notices)
+        scanner.jupsim = FakeSim(route_ok=False)
+        try:
+            token = _token()
+            self._watch(scanner, token)
+            await scanner.poll_token(token)
+            self.assertNotIn(token.address, scanner.positions)
+            self.assertEqual(notices.sent, [])
+        finally:
+            await scanner.aclose()
+
+    async def test_sell_note_attached_to_close_alert(self):
+        settings = Settings(api_key="x")
+        notices = FakeNotifier()
+        fake = FakeBirdeye()
+        scanner = self._scanner(fake, settings, notices)
+        scanner.jupsim = FakeSim()
+
+        async def six_decimals(address):
+            return 6
+
+        scanner._decimals = six_decimals
+        try:
+            token = _token()
+            self._watch(scanner, token)
+            await scanner.poll_token(token)
+            fake.trades = []
+            token.price_usd = 0.5
+            await scanner.poll_token(token)
+            _kind, close_alert = notices.sent[-1]
+            self.assertIn("Stop-loss", close_alert.reason)
+            self.assertIn("Sim sell", close_alert.sim_text)
+            self.assertIn("route OK", close_alert.sim_text)
+            kinds = [c[0] for c in scanner.jupsim.calls]
+            self.assertIn("buy", kinds)
+            self.assertIn("sell", kinds)
         finally:
             await scanner.aclose()
 

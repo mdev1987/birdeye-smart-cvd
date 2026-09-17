@@ -1,4 +1,11 @@
-"""Pure strategy logic: no network calls and no trade execution."""
+"""Pure strategy logic: no network calls and no trade execution.
+
+Strategy under test: "Smart-Money Proxy + 15m CVD". The smart-money leg
+is a free-tier *proxy* derived from tagged top traders (``smart_trader``
+by default), NOT Birdeye's paid Smart Money feed. Keep the "Proxy" label
+in logs/alerts/docs so later backtests never compare two materially
+different signals by accident.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +15,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from .models import CVDState, SmartMoneyStats, TokenCandidate
+
+#: Canonical research name. Import this wherever the strategy is displayed
+#: (logs, Telegram alerts, README) instead of hand-typing variants.
+STRATEGY_NAME = "Smart-Money Proxy + 15m CVD"
 
 
 @dataclass(slots=True)
@@ -52,6 +63,7 @@ class RollingCVD:
         sell = sum(point.volume_usd for point in self.points if point.side == "sell")
         self.state.buy_volume_usd = buy
         self.state.sell_volume_usd = sell
+        self.state.trade_count = len(self.points)
         return self.state
 
 
@@ -164,7 +176,9 @@ def _tags(row: dict[str, Any]) -> set[str]:
 def smart_money_stats(rows: list[dict[str, Any]], smart_tags: tuple[str, ...]) -> SmartMoneyStats:
     """Estimate smart-money flow from tagged top traders.
 
-    This is a proxy rather than Birdeye's dedicated Smart Money API.
+    This is the "Smart-Money Proxy" leg of "Smart-Money Proxy + 15m CVD":
+    a free-tier proxy built from Standard top-trader tags, rather than
+    Birdeye's dedicated (paid) Smart Money API.
     """
     wanted = set(smart_tags)
     stats = SmartMoneyStats()
@@ -293,14 +307,49 @@ def entry_allowed(
     min_smart_buy_ratio: float,
     min_cvd_ratio: float,
     max_price_change_24h: float,
+    min_cvd_volume_usd: float = 2000.0,
+    min_cvd_trades: int = 10,
 ) -> bool:
-    """Return True when the candidate passes all entry confirmation gates."""
-    return (
-        smart.tagged_wallets >= min_smart_wallets
-        and smart.buy_ratio >= min_smart_buy_ratio
-        and cvd.buy_sell_ratio >= min_cvd_ratio
-        and candidate.price_change_24h_pct <= max_price_change_24h
-    )
+    """Return True when the candidate passes all entry confirmation gates.
+
+    The CVD leg requires a minimum *sample size* in addition to the
+    buy/sell ratio: without ``min_cvd_volume_usd`` / ``min_cvd_trades`` a
+    trivial "$2 buy / $0 sells" window yields an infinite ratio and would
+    pass the gate. These thresholds are research parameters — tune and
+    validate them on historical data, do not treat the defaults as truth.
+    """
+    if smart.tagged_wallets < min_smart_wallets:
+        return False
+    if smart.buy_ratio < min_smart_buy_ratio:
+        return False
+    if cvd.buy_sell_ratio < min_cvd_ratio:
+        return False
+    if cvd.total_volume_usd < min_cvd_volume_usd:
+        return False
+    if cvd.trade_count < min_cvd_trades:
+        return False
+    if candidate.price_change_24h_pct > max_price_change_24h:
+        return False
+    return True
+
+
+def chase_ok(current_price_usd: float, discovery_price_usd: float,
+             max_surge_pct: float) -> bool:
+    """Return True when the live price has not sprinted past discovery.
+
+    Playbook: flat-or-negative 24h is the good entry; never FOMO an
+    extended breakout. The signal fires on the poll loop, so by entry time
+    the price may already have run. ``max_surge_pct <= 0`` disables the
+    guard. Missing/zero snapshots fail open (no data, no veto).
+    """
+    if max_surge_pct <= 0:
+        return True
+    if not discovery_price_usd or discovery_price_usd <= 0:
+        return True
+    if not current_price_usd or current_price_usd <= 0:
+        return True
+    surge_pct = (current_price_usd / discovery_price_usd - 1.0) * 100.0
+    return surge_pct <= max_surge_pct
 
 
 # ---------------------------------------------------------------------------

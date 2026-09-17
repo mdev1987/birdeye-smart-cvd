@@ -56,6 +56,14 @@ class Settings:
     base_url: str = "https://public-api.birdeye.so"
     api_min_request_interval_seconds: float = 1.5
 
+    # Research mode: which pipeline stages run. Lets the core hypothesis
+    # be tested before risk/enrichment influence the result.
+    #   CORE     = Birdeye trending/overview/top-traders/trades + proxy + CVD
+    #   RISK     = CORE + RugCheck + Helius
+    #   ENRICHED = RISK + Jupiter + DexScreener + CabalSpy (full pipeline)
+    # Telegram alerting stays orthogonal (fires in every mode when configured).
+    scanner_mode: str = "enriched"
+
     discovery_interval_seconds: int = 300
     poll_interval_seconds: int = 30
     candidate_limit: int = 10
@@ -67,7 +75,8 @@ class Settings:
     min_liquidity_usd: float = 10_000
     max_token_age_hours: int = 24
 
-    # Standard-tier top-trader tags are used as a smart-money proxy.
+    # Standard-tier top-trader tags are used as a Smart-Money Proxy
+    # (free-tier stand-in for Birdeye's paid Smart Money feed).
     # Birdeye documents these Solana wallet_tags values: dev, bundler,
     # sniper, insider, smart_trader.
     top_traders_limit: int = 10
@@ -78,6 +87,10 @@ class Settings:
     # The playbook uses a 15m CVD confirmation.
     cvd_window_seconds: int = 900
     cvd_min_buy_sell_ratio: float = 1.20
+    # Minimum CVD sample size: a "$2 buy / $0 sells" window has an infinite
+    # ratio but no information. Research parameters — validate on history.
+    cvd_min_volume_usd: float = 2000.0
+    cvd_min_trades: int = 10
     max_price_change_24h_percent: float = 80.0
 
     # Simple signal lifecycle. These are bot additions, not rules quoted
@@ -85,6 +98,24 @@ class Settings:
     stop_loss_percent: float = 15.0
     take_profit_percent: float = 50.0
     max_hold_seconds: int = 2400
+    # Partial take-profit ladder (playbook risk rules scale out: 50% at x2,
+    # 30% at x3, moonbag runner). TP1 banks TP1_FRACTION of the position at
+    # +TAKE_PROFIT_PERCENT; TP2 banks TP2_FRACTION of the remainder at
+    # +TAKE_PROFIT2_PERCENT; the rest rides to bearish/SL/TTL/volume exits.
+    take_profit2_percent: float = 100.0
+    tp1_fraction: float = 0.5
+    tp2_fraction: float = 0.5
+    # Trailing profit lock: once pnl >= TRAIL_ARM_PCT, exit the runner if
+    # price falls TRAIL_STOP_PCT below its post-entry peak. 0 disables.
+    trail_arm_pct: float = 20.0
+    trail_stop_pct: float = 30.0
+    # "Exit immediately if volume dies" (playbook): exit after this many
+    # consecutive polls with zero new trades. 0 disables.
+    volume_death_quiet_polls: int = 6
+    # Entry chase guard (playbook: flat is the entry, never FOMO the
+    # breakout): skip BUY when live price exceeds the discovery snapshot
+    # by more than this. 0 disables.
+    entry_max_surge_pct: float = 30.0
     # Consecutive bearish-CVD polls required before a paper exit fires.
     # Guards against single-poll whipsaw (1.3x -> 0.8x -> 1.4x).
     bearish_exit_confirmations: int = 2
@@ -133,6 +164,20 @@ class Settings:
     helius_verify_window_hours: int = 24
     helius_verify_limit: int = 10
 
+    # Simulate-only Jupiter execution checks (quote + assemble + sign +
+    # simulateTransaction, NEVER broadcast). Uses the Swap v2 /order API
+    # (JUPITER_API_KEY, header x-api-key) and a throwaway PRIVATE_KEY that
+    # only signs locally for the simulator. Inert unless PRIVATE_KEY is set;
+    # advisory-only unless SIM_REQUIRE_ROUTE is enabled.
+    sim_enabled: bool = True
+    jupiter_api_key: str = ""
+    jupiter_base_url: str = "https://api.jup.ag"
+    private_key: str = ""
+    jupiter_order_timeout_s: float = 12.0
+    sim_slippage_bps: int = 300
+    sim_max_impact_pct: float = 5.0
+    sim_require_route: bool = False
+
     # Telegram paper alerts. Inert unless token + chat are both set.
     telegram_enabled: bool = True
     telegram_bot_token: str = ""
@@ -142,6 +187,16 @@ class Settings:
     paper_start_balance_usd: float = 1000.0
     paper_position_size_usd: float = 100.0
     max_open_positions: int = 3
+
+    @property
+    def use_risk_checks(self) -> bool:
+        """True in RISK and ENRICHED modes (RugCheck + Helius)."""
+        return self.scanner_mode in {"risk", "enriched"}
+
+    @property
+    def use_enrichment(self) -> bool:
+        """True only in ENRICHED mode (Jupiter + DexScreener + CabalSpy)."""
+        return self.scanner_mode == "enriched"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -162,6 +217,7 @@ class Settings:
         settings = cls(
             api_key=api_key,
             chain=(_raw("CHAIN") or "solana").lower(),
+            scanner_mode=(_raw("SCANNER_MODE") or "enriched").lower(),
             api_min_request_interval_seconds=_float("API_MIN_REQUEST_INTERVAL_SECONDS", 1.5),
             discovery_interval_seconds=_int("DISCOVERY_INTERVAL_SECONDS", 300),
             poll_interval_seconds=_int("POLL_INTERVAL_SECONDS", 30),
@@ -177,9 +233,18 @@ class Settings:
             min_smart_buy_ratio=_float("MIN_SMART_BUY_RATIO", 0.60),
             cvd_window_seconds=_int("CVD_WINDOW_SECONDS", 900),
             cvd_min_buy_sell_ratio=_float("CVD_MIN_BUY_SELL_RATIO", 1.20),
+            cvd_min_volume_usd=_float("CVD_MIN_VOLUME_USD", 2000.0),
+            cvd_min_trades=_int("CVD_MIN_TRADES", 10),
             max_price_change_24h_percent=_float("MAX_PRICE_CHANGE_24H_PERCENT", 80),
             stop_loss_percent=_float("STOP_LOSS_PERCENT", 15),
             take_profit_percent=_float("TAKE_PROFIT_PERCENT", 50),
+            take_profit2_percent=_float("TAKE_PROFIT2_PCT", 100),
+            tp1_fraction=_float("TP1_FRACTION", 0.5),
+            tp2_fraction=_float("TP2_FRACTION", 0.5),
+            trail_arm_pct=_float("TRAIL_ARM_PCT", 20),
+            trail_stop_pct=_float("TRAIL_STOP_PCT", 30),
+            volume_death_quiet_polls=_int("VOLUME_DEATH_QUIET_POLLS", 6),
+            entry_max_surge_pct=_float("ENTRY_MAX_SURGE_PCT", 30),
             max_hold_seconds=_int("MAX_HOLD_SECONDS", 2400),
             bearish_exit_confirmations=_int("BEARISH_EXIT_CONFIRMATIONS", 2),
             enforce_token_age=_bool("ENFORCE_TOKEN_AGE", True),
@@ -220,6 +285,16 @@ class Settings:
             helius_require_confirmed=_bool("HELIUS_REQUIRE_CONFIRMED", False),
             helius_verify_window_hours=_int("HELIUS_VERIFY_WINDOW_HOURS", 24),
             helius_verify_limit=_int("HELIUS_VERIFY_LIMIT", 10),
+            sim_enabled=_bool("SIM_ENABLED", True),
+            jupiter_api_key=(_raw("JUPITER_API_KEY") or ""),
+            jupiter_base_url=(
+                _raw("JUPITER_BASE_URL") or "https://api.jup.ag"
+            ),
+            private_key=(_raw("PRIVATE_KEY") or ""),
+            jupiter_order_timeout_s=_float("JUPITER_ORDER_TIMEOUT_S", 12),
+            sim_slippage_bps=_int("SIM_SLIPPAGE_BPS", 300),
+            sim_max_impact_pct=_float("SIM_MAX_IMPACT_PCT", 5.0),
+            sim_require_route=_bool("SIM_REQUIRE_ROUTE", False),
             telegram_enabled=_bool("TELEGRAM_ENABLED", True),
             telegram_bot_token=(_raw("TELEGRAM_BOT_TOKEN") or ""),
             telegram_chat_id=(_raw("TELEGRAM_CHAT_ID") or ""),
@@ -230,6 +305,12 @@ class Settings:
 
         if settings.chain != "solana":
             raise ValueError("This strategy is intentionally configured for Solana")
+        if settings.scanner_mode not in {"core", "risk", "enriched"}:
+            raise ValueError("SCANNER_MODE must be one of: core, risk, enriched")
+        if settings.cvd_min_volume_usd < 0:
+            raise ValueError("CVD_MIN_VOLUME_USD must be >= 0")
+        if settings.cvd_min_trades < 1:
+            raise ValueError("CVD_MIN_TRADES must be >= 1")
         if settings.api_min_request_interval_seconds < 1.0:
             raise ValueError("API_MIN_REQUEST_INTERVAL_SECONDS must be >= 1.0 for Standard 1 RPS")
         if settings.poll_interval_seconds < 5:
@@ -242,6 +323,24 @@ class Settings:
             raise ValueError("BEARISH_EXIT_CONFIRMATIONS must be >= 1")
         if settings.max_token_age_hours < 1:
             raise ValueError("MAX_TOKEN_AGE_HOURS must be >= 1")
+        if settings.take_profit_percent <= 0:
+            raise ValueError("TAKE_PROFIT_PERCENT must be > 0")
+        if settings.take_profit2_percent <= settings.take_profit_percent:
+            raise ValueError("TAKE_PROFIT2_PCT must be above TAKE_PROFIT_PERCENT")
+        for name, frac in (
+            ("TP1_FRACTION", settings.tp1_fraction),
+            ("TP2_FRACTION", settings.tp2_fraction),
+        ):
+            if not 0 < frac < 1:
+                raise ValueError(f"{name} must be between 0 and 1 (exclusive)")
+        if settings.trail_arm_pct < 0:
+            raise ValueError("TRAIL_ARM_PCT must be >= 0 (0 arms immediately)")
+        if settings.trail_stop_pct < 0:
+            raise ValueError("TRAIL_STOP_PCT must be >= 0 (0 disables the trail)")
+        if settings.volume_death_quiet_polls < 0:
+            raise ValueError("VOLUME_DEATH_QUIET_POLLS must be >= 0 (0 disables)")
+        if settings.entry_max_surge_pct < 0:
+            raise ValueError("ENTRY_MAX_SURGE_PCT must be >= 0 (0 disables)")
         if not 0 <= settings.rugcheck_max_score <= 100:
             raise ValueError("RUGCHECK_MAX_SCORE must be between 0 and 100")
         if settings.cabalspy_min_wallets < 1:
@@ -252,6 +351,12 @@ class Settings:
             raise ValueError("HELIUS_VERIFY_WINDOW_HOURS must be >= 1")
         if not 1 <= settings.helius_verify_limit <= 100:
             raise ValueError("HELIUS_VERIFY_LIMIT must be between 1 and 100")
+        if settings.jupiter_order_timeout_s < 1:
+            raise ValueError("JUPITER_ORDER_TIMEOUT_S must be >= 1")
+        if not 0 <= settings.sim_slippage_bps <= 10_000:
+            raise ValueError("SIM_SLIPPAGE_BPS must be between 0 and 10000")
+        if settings.sim_max_impact_pct < 0:
+            raise ValueError("SIM_MAX_IMPACT_PCT must be >= 0")
         if settings.paper_start_balance_usd <= 0:
             raise ValueError("PAPER_START_BALANCE_USD must be > 0")
         if settings.paper_position_size_usd <= 0:

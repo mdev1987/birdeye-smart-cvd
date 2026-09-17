@@ -15,6 +15,13 @@ import httpx
 from .ratelimit import AsyncRateLimiter
 
 
+def _redact(text: str) -> str:
+    """Scrub the query-string API key so errors are safe for daemon logs."""
+    import re
+
+    return re.sub(r"api_key=[^&\s'\"]*", "api_key=***", text)
+
+
 class CabalSpyError(RuntimeError):
     """Raised when CabalSpy returns an error or unusable payload."""
 
@@ -67,7 +74,7 @@ class CabalSpyClient:
                 response = await self._client.get(path, params=query)
             except httpx.HTTPError as exc:
                 self._limiter.mark()
-                raise CabalSpyError(f"network error: {exc}") from exc
+                raise CabalSpyError(f"network error: {_redact(str(exc))}") from exc
             self._limiter.mark()
 
             if response.status_code in (401, 403):

@@ -12,11 +12,14 @@ from .config import Settings
 from .dexscreener import DexScreenerClient, DexScreenerError
 from .helius import HeliusClient, HeliusError
 from .jupiter import JupiterClient, JupiterError
+from .jupsim import JupiterSim, SimResult
 from .models import PositionState, TokenCandidate
 from .paper import PaperPortfolio
 from .rugcheck import RugCheckClient, RugCheckError
 from .strategy import (
+    STRATEGY_NAME,
     RollingCVD,
+    chase_ok,
     count_wallet_buys,
     enrichment_from_pair,
     entry_allowed,
@@ -40,7 +43,13 @@ log = logging.getLogger(__name__)
 
 
 class Scanner:
-    """Signal-only scanner that deliberately performs no trades."""
+    """Signal-only scanner that deliberately performs no trades.
+
+    Strategy under test: "Smart-Money Proxy + 15m CVD" (see
+    ``strategy.STRATEGY_NAME``). ``Settings.scanner_mode`` selects how much
+    of the pipeline runs: CORE (Birdeye only) isolates the hypothesis,
+    RISK adds RugCheck+Helius, ENRICHED adds Jupiter+DexScreener+CabalSpy.
+    """
 
     def __init__(
         self,
@@ -55,6 +64,10 @@ class Scanner:
         self.positions: dict[str, PositionState] = {}
         self.last_discovery = 0.0
         self.watched: dict[str, TokenCandidate] = {}
+        # Peak tagged smart-wallet count seen per watched token this session.
+        # Playbook: entries are better when smart participation *grows*; the
+        # trend is logged as context (advisory, never a gate).
+        self.smart_peak: dict[str, int] = {}
         self.portfolio = portfolio or PaperPortfolio(
             settings.paper_start_balance_usd,
             settings.paper_position_size_usd,
@@ -76,28 +89,41 @@ class Scanner:
 
         # Free keyless enrichment clients. Each degrades independently:
         # a failure here only loses an enrichment source, never a signal.
+        # SCANNER_MODE is the master switch: CORE runs Birdeye only (no
+        # aux calls at all), RISK adds RugCheck+Helius, ENRICHED adds the
+        # rest. Individual *_ENABLED flags only matter inside an allowing
+        # mode. Telegram alerting stays orthogonal (all modes).
+        use_risk = settings.use_risk_checks
+        use_enrichment = settings.use_enrichment
+        log.info(
+            "strategy=%s mode=%s (risk=%s enrichment=%s)",
+            STRATEGY_NAME,
+            settings.scanner_mode.upper(),
+            "on" if use_risk else "off",
+            "on" if use_enrichment else "off",
+        )
         self.dex = (
             DexScreenerClient(
                 min_request_interval=settings.dexscreener_min_request_interval_seconds
             )
-            if settings.dexscreener_enabled
+            if use_enrichment and settings.dexscreener_enabled
             else None
         )
         self.jup = (
             JupiterClient(
                 min_request_interval=settings.jupiter_min_request_interval_seconds
             )
-            if settings.jupiter_enabled
+            if use_enrichment and settings.jupiter_enabled
             else None
         )
         self.rug = (
             RugCheckClient(
                 min_request_interval=settings.rugcheck_min_request_interval_seconds
             )
-            if settings.rugcheck_enabled
+            if use_risk and settings.rugcheck_enabled
             else None
         )
-        if settings.cabalspy_enabled and settings.cabalspy_api_key:
+        if use_enrichment and settings.cabalspy_enabled and settings.cabalspy_api_key:
             self.cabal: CabalSpyClient | None = CabalSpyClient(
                 settings.cabalspy_api_key,
                 min_request_interval=settings.cabalspy_min_request_interval_seconds,
@@ -108,7 +134,7 @@ class Scanner:
             if settings.cabalspy_enabled:
                 log.info("CabalSpy disabled: set CABALSPY_API_KEY to enable cluster confirmation")
 
-        if settings.helius_enabled and settings.helius_api_key:
+        if use_risk and settings.helius_enabled and settings.helius_api_key:
             self.helius: HeliusClient | None = HeliusClient(
                 settings.helius_api_key,
                 settings.helius_rpc_url,
@@ -124,9 +150,39 @@ class Scanner:
         if settings.cabalspy_require_cluster and self.cabal is None:
             log.warning("CABALSPY_REQUIRE_CLUSTER is set but CabalSpy is disabled; gate is inert")
 
+        # Simulate-only Jupiter execution checks (ENRICHED only). Quote +
+        # assemble + local sign + simulateTransaction; NEVER broadcasts
+        # (JupiterSim has no execute/send path). Inert unless a throwaway
+        # PRIVATE_KEY is set; advisory-only unless SIM_REQUIRE_ROUTE.
+        if use_enrichment and settings.sim_enabled and settings.private_key:
+            self.jupsim: JupiterSim | None = JupiterSim(
+                settings.jupiter_api_key,
+                settings.jupiter_base_url,
+                settings.private_key,
+                rpc_simulate=self.helius.rpc if self.helius is not None else None,
+                order_timeout=settings.jupiter_order_timeout_s,
+                slippage_bps=settings.sim_slippage_bps,
+            )
+            if self.jupsim.has_key:
+                log.info(
+                    "Jupiter simulate-only checks enabled "
+                    "(quote+simulate via %s, never broadcast)",
+                    settings.jupiter_base_url,
+                )
+            else:
+                log.warning("PRIVATE_KEY is not a valid keypair; sim checks degraded")
+                self.jupsim = None
+        else:
+            self.jupsim = None
+            if settings.sim_enabled and use_enrichment:
+                log.info("Jupiter sim disabled: set PRIVATE_KEY to enable quote+simulate checks")
+        if settings.sim_require_route and self.jupsim is None:
+            log.warning("SIM_REQUIRE_ROUTE is set but sim checks are disabled; gate is inert")
+
     async def aclose(self) -> None:
         """Close auxiliary HTTP clients (Birdeye client is owned by main)."""
-        for aux in (self.dex, self.jup, self.rug, self.cabal, self.helius, self.notifier):
+        for aux in (self.dex, self.jup, self.rug, self.cabal, self.helius,
+                    self.jupsim, self.notifier):
             if aux is not None:
                 try:
                     await aux.close()
@@ -180,7 +236,7 @@ class Scanner:
 
     async def _dex_pairs(self, address: str) -> list[dict] | None:
         """Return DexScreener pairs, or None when unavailable/disabled."""
-        if self.dex is None:
+        if self.dex is None or not self.settings.use_enrichment:
             return None
         try:
             return await self.dex.token_pairs(address)
@@ -190,7 +246,7 @@ class Scanner:
 
     async def _jupiter_entry(self, address: str) -> dict | None:
         """Return the Jupiter price object, or None when unavailable."""
-        if self.jup is None:
+        if self.jup is None or not self.settings.use_enrichment:
             return None
         try:
             entry = await self.jup.price(address)
@@ -231,7 +287,7 @@ class Scanner:
 
     async def _helius_concentration(self, candidate: TokenCandidate) -> bool:
         """Check holder concentration. Fail-open; optional veto. True == keep."""
-        if self.helius is None:
+        if self.helius is None or not self.settings.use_risk_checks:
             return True
         try:
             accounts = await self.helius.largest_accounts(candidate.address)
@@ -262,6 +318,7 @@ class Scanner:
         """Count owners with on-chain buys in the window. None when skipped."""
         if (
             self.helius is None
+            or not self.settings.use_risk_checks
             or not self.settings.helius_verify_wallets
             or not owners
         ):
@@ -272,7 +329,8 @@ class Scanner:
         for owner in owners[: self.settings.top_traders_limit]:
             try:
                 transfers = await self.helius.inbound_transfers(
-                    owner, token_address, limit=self.settings.helius_verify_limit
+                    owner, token_address, limit=self.settings.helius_verify_limit,
+                    since_unix=since,
                 )
             except HeliusError as exc:
                 log.warning("helius verify failed %s: %s", owner[:8], exc)
@@ -285,7 +343,7 @@ class Scanner:
 
     async def _rugcheck_ok(self, candidate: TokenCandidate) -> bool:
         """Apply the RugCheck pre-entry veto. Fail-open unless strict."""
-        if self.rug is None:
+        if self.rug is None or not self.settings.use_risk_checks:
             return True
         try:
             summary = await self.rug.summary(candidate.address)
@@ -371,14 +429,17 @@ class Scanner:
                         self.settings.max_token_age_hours,
                     )
                     continue
-            if self.settings.rugcheck_enabled:
+            if self.settings.use_risk_checks and self.settings.rugcheck_enabled:
                 if not await self._rugcheck_ok(candidate):
                     gated_filtered += 1
                     continue
-            if not await self._helius_concentration(candidate):
+            if self.settings.use_risk_checks and not await self._helius_concentration(candidate):
                 gated_filtered += 1
                 continue
 
+            # Freeze the discovery price: the entry chase guard compares
+            # the live poll price against this snapshot.
+            candidate.discovery_price_usd = candidate.price_usd
             candidates[address] = candidate
             if len(candidates) >= self.settings.max_watched_tokens:
                 break
@@ -390,11 +451,12 @@ class Scanner:
 
         self.last_discovery = time.time()
         log.info(
-            "discovered %d candidates (%d trending, %d base-filtered, %d age/risk-filtered)",
+            "discovered %d candidates (%d trending, %d base-filtered, %d age/risk-filtered) [mode=%s]",
             len(self.watched),
             len(rows),
             base_filtered,
             gated_filtered,
+            self.settings.scanner_mode.upper(),
         )
         for token in self.watched.values():
             risk_text = f" risk={token.risk_score}" if token.risk_score is not None else ""
@@ -427,7 +489,12 @@ class Scanner:
         label: str,
         log_level: str = "info",
     ) -> None:
-        """Settle a paper position: accounting, log line and TG alert."""
+        """Settle a paper position: accounting, log line and TG alert.
+
+        Settles the *remaining* notional (after any partial take-profits).
+        The win/loss verdict is judged on banked partials + this slice
+        combined, so one scaled exit counts as exactly one trade.
+        """
         position = self.positions.pop(address, None)
         if position is None:
             return
@@ -436,9 +503,28 @@ class Scanner:
         full_address = token.address if token is not None else address
         entry = position.entry_price_usd
         close_price = exit_price_usd if exit_price_usd and exit_price_usd > 0 else entry
-        result = self.portfolio.close(entry, close_price, position.notional_usd)
+        remaining = position.remaining_notional_usd or position.notional_usd
+        slice_pnl = (
+            remaining * close_price / entry - remaining
+            if entry > 0 and remaining > 0
+            else 0.0
+        )
+        total_pnl = position.realized_pnl_usd + slice_pnl
+        result = self.portfolio.close(
+            entry, close_price, remaining, win_override=(total_pnl >= 0)
+        )
+        # Advisory sell feasibility for the runner (quote+simulate, no send).
+        sim_text = ""
+        if token is not None and entry > 0 and remaining > 0:
+            sim_res = await self._sim_sell(token, remaining / entry)
+            sim_text = self._sim_note(sim_res, close_price)
+            if sim_text:
+                log.info("sim sell %-10s %s", symbol, sim_text)
         now = time.time()
-        getattr(log, log_level)("EXIT %-10s %s pnl=%+.1f%%", symbol, label, result.pnl_pct)
+        getattr(log, log_level)(
+            "EXIT %-10s %s pnl=%+.1f%% (slice) total=%+.2f",
+            symbol, label, result.pnl_pct, total_pnl,
+        )
         if self.notifier.enabled:
             await self.notifier.send_close(
                 CloseAlert(
@@ -461,6 +547,81 @@ class Scanner:
                     open_positions=len(self.positions),
                     max_open_positions=self.settings.max_open_positions,
                     timestamp=now,
+                    sim_text=sim_text,
+                )
+            )
+
+    async def _partial_close(
+        self,
+        address: str,
+        token: TokenCandidate,
+        exit_price_usd: float,
+        *,
+        fraction: float,
+        rung: str,
+        reason: str,
+        icon: str,
+    ) -> None:
+        """Bank one take-profit rung: settle a slice, keep the runner open.
+
+        Cash + realized PnL move immediately; wins/losses are untouched
+        (judged once at final close). A Telegram CLOSE alert marked with
+        the rung records the scale-out.
+        """
+        position = self.positions.get(address)
+        if position is None:
+            return
+        remaining = position.remaining_notional_usd or position.notional_usd
+        slice_notional = remaining * fraction
+        if slice_notional <= 0 or remaining <= 0:
+            return
+        close_price = exit_price_usd if exit_price_usd and exit_price_usd > 0 else position.entry_price_usd
+        result = self.portfolio.close_partial(
+            position.entry_price_usd, close_price, slice_notional
+        )
+        position.remaining_notional_usd = remaining - slice_notional
+        position.realized_pnl_usd += result.pnl_usd
+        if rung == "TP1":
+            position.tp1_done = True
+        elif rung == "TP2":
+            position.tp2_done = True
+        position.bearish_streak = 0
+        now = time.time()
+        # Advisory sell feasibility on the first scale-out only (TP2 rides
+        # the same route minutes later; re-quoting adds no information).
+        sim_text = ""
+        if rung == "TP1":
+            sim_res = await self._sim_sell(token, slice_notional / position.entry_price_usd)
+            sim_text = self._sim_note(sim_res, close_price)
+        log.warning(
+            "PARTIAL %-10s %s slice=$%.2f pnl=%+.1f%% banked=%+.2f left=$%.2f%s",
+            token.symbol, rung, slice_notional, result.pnl_pct,
+            position.realized_pnl_usd, position.remaining_notional_usd,
+            f" {sim_text}" if sim_text else "",
+        )
+        if self.notifier.enabled:
+            await self.notifier.send_close(
+                CloseAlert(
+                    symbol=token.symbol,
+                    name=token.name or position.name or "?",
+                    address=token.address,
+                    reason=reason,
+                    reason_icon=icon,
+                    exit_price_usd=close_price,
+                    entry_price_usd=position.entry_price_usd,
+                    pnl_usd=result.pnl_usd,
+                    pnl_pct=result.pnl_pct,
+                    hold_seconds=max(0.0, now - position.entry_time),
+                    cash_before_usd=result.cash_before_usd,
+                    cash_after_usd=result.cash_after_usd,
+                    realized_total_usd=result.realized_total_usd,
+                    wins=result.wins,
+                    losses=result.losses,
+                    win_rate_pct=result.win_rate_pct,
+                    open_positions=len(self.positions),
+                    max_open_positions=self.settings.max_open_positions,
+                    timestamp=now,
+                    sim_text=sim_text,
                 )
             )
 
@@ -486,6 +647,9 @@ class Scanner:
         for address in list(self.cvd):
             if address not in candidates:
                 del self.cvd[address]
+        for address in list(self.smart_peak):
+            if address not in candidates:
+                del self.smart_peak[address]
 
     @staticmethod
     def _candidate_from_overview(address: str, data: dict) -> TokenCandidate | None:
@@ -585,7 +749,11 @@ class Scanner:
         smart = smart_money_stats(trader_rows, self.settings.smart_tags)
         points = [normalize_trade(row, token.address) for row in trade_rows]
         normalized = [point for point in points if point is not None]
+        prev_last_ts = self.cvd[token.address].state.last_trade_timestamp
         state = self.cvd[token.address].add(normalized)
+        # Tape advanced when genuinely new trades arrived (dedup-aware).
+        # A flat tape across polls means interest died, not calm holding.
+        tape_advanced = state.last_trade_timestamp > prev_last_ts
 
         # Execution price chain: newest normalized trade price first
         # (no extra request), then free Jupiter quote, then discovery
@@ -602,9 +770,10 @@ class Scanner:
             else:
                 token.price_source = "discovery"
 
-        # Optional CabalSpy cluster confirmation (advisory unless required).
+        # Optional CabalSpy cluster confirmation (ENRICHED only, advisory
+        # unless required).
         cluster_wallets: int | None = None
-        if self.cabal is not None:
+        if self.cabal is not None and self.settings.use_enrichment:
             try:
                 signals = await self.cabal.cluster_signals(
                     min_wallets=self.settings.cabalspy_min_wallets
@@ -613,16 +782,26 @@ class Scanner:
             except CabalSpyError as exc:
                 log.warning("cabal cluster failed %-10s: %s", token.symbol, exc)
 
+        if smart.tagged_wallets > self.smart_peak.get(token.address, 0):
+            self.smart_peak[token.address] = smart.tagged_wallets
+        trend = ""
+        position_open = self.positions.get(token.address)
+        if position_open is not None:
+            trend = f" smart-trend={position_open.smart_at_entry}->{smart.tagged_wallets}"
+
         log.info(
-            "watch %-10s smart=%d buy%%=%.0f CVD=$%+.0f buy/sell=%.2fx price[%s]=$%.8f%s",
+            "watch %-10s smart-proxy=%d buy%%=%.0f CVD=$%+.0f buy/sell=%.2fx vol=$%.0f n=%d price[%s]=$%.8f%s%s",
             token.symbol,
             smart.tagged_wallets,
             smart.buy_ratio * 100,
             state.cvd_usd,
             state.buy_sell_ratio,
+            state.total_volume_usd,
+            state.trade_count,
             token.price_source,
             token.price_usd,
             f" cluster={cluster_wallets}" if cluster_wallets is not None else "",
+            trend,
         )
 
         now = time.time()
@@ -630,8 +809,24 @@ class Scanner:
         if position:
             position.symbol = token.symbol
             position.name = token.name or position.name
+            if tape_advanced:
+                position.quiet_polls = 0
+            else:
+                position.quiet_polls += 1
+            if token.price_usd > 0:
+                position.peak_price_usd = max(position.peak_price_usd, token.price_usd)
             pnl_pct = (token.price_usd / position.entry_price_usd - 1) * 100
             age = now - position.entry_time
+            death_polls = self.settings.volume_death_quiet_polls
+            trail_pct = self.settings.trail_stop_pct
+            if pnl_pct >= self.settings.trail_arm_pct:
+                position.trail_armed = True
+            trailing = (
+                trail_pct > 0
+                and position.trail_armed
+                and position.peak_price_usd > 0
+                and token.price_usd <= position.peak_price_usd * (1 - trail_pct / 100)
+            )
 
             if pnl_pct <= -self.settings.stop_loss_percent:
                 await self._close_position(
@@ -639,10 +834,30 @@ class Scanner:
                     reason="Stop-loss 🛑", icon="🔴",
                     label="stop-loss", log_level="warning",
                 )
-            elif pnl_pct >= self.settings.take_profit_percent:
+            elif not position.tp1_done and pnl_pct >= self.settings.take_profit_percent:
+                await self._partial_close(
+                    token.address, token, token.price_usd,
+                    fraction=self.settings.tp1_fraction,
+                    rung="TP1",
+                    reason=f"Partial TP1 (+{self.settings.take_profit_percent:.0f}%) 🔶",
+                    icon="🟡",
+                )
+            elif not position.tp2_done and pnl_pct >= self.settings.take_profit2_percent:
+                await self._partial_close(
+                    token.address, token, token.price_usd,
+                    fraction=self.settings.tp2_fraction,
+                    rung="TP2",
+                    reason=f"Partial TP2 (+{self.settings.take_profit2_percent:.0f}%) 🔷",
+                    icon="🔵",
+                )
+            elif trailing:
                 await self._close_position(
                     token.address, token, token.price_usd,
-                    reason="Take-profit 🎯", icon="🟢", label="take-profit",
+                    reason="Trailing stop 🪝", icon="🟣",
+                    label=(
+                        f"trailing -{trail_pct:.0f}% from peak "
+                        f"${position.peak_price_usd:.8f}"
+                    ),
                 )
             elif state.buy_sell_ratio < 1.0:
                 position.bearish_streak += 1
@@ -663,6 +878,12 @@ class Scanner:
                         position.bearish_streak,
                         self.settings.bearish_exit_confirmations,
                     )
+            elif death_polls > 0 and position.quiet_polls >= death_polls:
+                await self._close_position(
+                    token.address, token, token.price_usd,
+                    reason="Volume died 💀", icon="⚪",
+                    label=f"no new trades x{position.quiet_polls} polls",
+                )
             elif age >= self.settings.max_hold_seconds:
                 await self._close_position(
                     token.address, token, token.price_usd,
@@ -679,8 +900,27 @@ class Scanner:
             min_smart_wallets=self.settings.min_smart_wallets,
             min_smart_buy_ratio=self.settings.min_smart_buy_ratio,
             min_cvd_ratio=self.settings.cvd_min_buy_sell_ratio,
+            min_cvd_volume_usd=self.settings.cvd_min_volume_usd,
+            min_cvd_trades=self.settings.cvd_min_trades,
             max_price_change_24h=self.settings.max_price_change_24h_percent,
         ):
+            # Playbook: flat is the entry, never FOMO the breakout. The
+            # signal loop lags the market, so re-check against discovery.
+            if not chase_ok(
+                token.price_usd,
+                token.discovery_price_usd,
+                self.settings.entry_max_surge_pct,
+            ):
+                surge = (
+                    token.price_usd / token.discovery_price_usd - 1.0
+                ) * 100.0
+                log.info(
+                    "skip BUY %-10s chasing +%.1f%% since discovery (max %.0f%%)",
+                    token.symbol,
+                    surge,
+                    self.settings.entry_max_surge_pct,
+                )
+                return
             if self.settings.cabalspy_require_cluster and self.cabal is not None:
                 if cluster_wallets is None or cluster_wallets < self.settings.cabalspy_min_wallets:
                     log.info(
@@ -691,7 +931,11 @@ class Scanner:
                     return
             helius_note = ""
             confirmed_checked: tuple[int, int] | None = None
-            if self.helius is not None and self.settings.helius_verify_wallets:
+            if (
+                self.helius is not None
+                and self.settings.use_risk_checks
+                and self.settings.helius_verify_wallets
+            ):
                 verified = await self._helius_confirmed(
                     token.address, tagged_owners(trader_rows, self.settings.smart_tags)
                 )
@@ -705,6 +949,18 @@ class Scanner:
                             token.symbol,
                         )
                         return
+            sim_res = await self._sim_buy(token, self.settings.paper_position_size_usd)
+            if self.settings.sim_require_route and self.jupsim is not None:
+                if sim_res is None or not sim_res.route_ok:
+                    log.info(
+                        "skip BUY %-10s no Jupiter route (required): %s",
+                        token.symbol,
+                        sim_res.reason if sim_res is not None else "sim unavailable",
+                    )
+                    return
+            sim_note = self._sim_note(sim_res, token.price_usd)
+            if sim_note:
+                log.info("sim buy %-10s %s", token.symbol, sim_note)
             opened = self.portfolio.try_open(len(self.positions))
             if not opened.opened:
                 log.info("skip BUY %-10s %s", token.symbol, opened.reason)
@@ -717,9 +973,12 @@ class Scanner:
                 notional_usd=opened.notional_usd,
                 balance_before_open_usd=opened.balance_before_usd,
                 balance_after_open_usd=opened.balance_after_usd,
+                remaining_notional_usd=opened.notional_usd,
+                peak_price_usd=token.price_usd,
+                smart_at_entry=smart.tagged_wallets,
             )
             log.warning(
-                "BUY SIGNAL %-10s price[%s]=$%.8f smart=%d smart_buy%%=%.0f CVD=$%+.0f ratio=%.2fx%s%s",
+                "BUY SIGNAL %-10s price[%s]=$%.8f smart-proxy=%d smart_buy%%=%.0f CVD=$%+.0f ratio=%.2fx vol=$%.0f n=%d%s%s",
                 token.symbol,
                 token.price_source,
                 token.price_usd,
@@ -727,11 +986,15 @@ class Scanner:
                 smart.buy_ratio * 100,
                 state.cvd_usd,
                 state.buy_sell_ratio,
+                state.total_volume_usd,
+                state.trade_count,
                 f" cluster={cluster_wallets}" if cluster_wallets is not None else "",
                 helius_note,
             )
             if self.notifier.enabled:
                 extra: list[str] = []
+                if sim_note:
+                    extra.append(sim_note)
                 if cluster_wallets is not None:
                     extra.append(f"🔗 Cluster: {cluster_wallets} tracked wallets")
                 if confirmed_checked is not None:
@@ -777,6 +1040,56 @@ class Scanner:
             return None
         return jupiter_price_usd(entry)
 
+    async def _decimals(self, address: str) -> int | None:
+        """Return cached mint decimals, or None (sim degrades to quote note)."""
+        if self.helius is None:
+            return None
+        try:
+            return await self.helius.token_decimals(address)
+        except HeliusError as exc:
+            log.warning("decimals failed %s: %s", address[:8], exc)
+            return None
+
+    async def _sim_buy(self, token: TokenCandidate, notional_usd: float) -> SimResult | None:
+        """Advisory buy feasibility check. Never raises, never blocks."""
+        if self.jupsim is None:
+            return None
+        try:
+            decimals = await self._decimals(token.address)
+            return await self.jupsim.check_buy(
+                token.address, notional_usd, out_decimals=decimals
+            )
+        except Exception as exc:  # noqa: BLE001 - advisory path only
+            log.warning("sim buy failed %-10s: %s", token.symbol, exc)
+            return None
+
+    async def _sim_sell(self, token: TokenCandidate, qty_ui: float) -> SimResult | None:
+        """Advisory sell feasibility check. Never raises, never blocks."""
+        if self.jupsim is None:
+            return None
+        try:
+            decimals = await self._decimals(token.address)
+            if decimals is None:
+                return None
+            return await self.jupsim.check_sell(
+                token.address, qty_ui, decimals, token.price_usd
+            )
+        except Exception as exc:  # noqa: BLE001 - advisory path only
+            log.warning("sim sell failed %-10s: %s", token.symbol, exc)
+            return None
+
+    def _sim_note(self, res: SimResult | None, signal_price_usd: float) -> str:
+        """Format a sim result for logs/alerts; flags excess impact."""
+        if res is None:
+            return ""
+        note = res.note(signal_price_usd)
+        if res.impact_pct is not None and res.impact_pct > self.settings.sim_max_impact_pct:
+            note += (
+                f" ⚠️ impact {res.impact_pct:.1f}%"
+                f" > max {self.settings.sim_max_impact_pct:.0f}%"
+            )
+        return note
+
     async def run(self) -> None:
         """Run discovery and monitoring until interrupted."""
         if not self._startup_sent:
@@ -790,10 +1103,12 @@ class Scanner:
                         max_open_positions=settings.max_open_positions,
                         max_watched_tokens=settings.max_watched_tokens,
                         detail_lines=(
-                            f"🧠 Smart ≥{settings.min_smart_wallets} wallets @ ≥{settings.min_smart_buy_ratio * 100:.0f}% buys",
-                            f"📈 CVD ≥{settings.cvd_min_buy_sell_ratio:.2f}x over {settings.cvd_window_seconds // 60}m",
-                            f"🕰 Age ≤{settings.max_token_age_hours}h | 🛡 Rug score ≤{settings.rugcheck_max_score}",
-                            f"🛑 SL {settings.stop_loss_percent:.0f}% | 🎯 TP {settings.take_profit_percent:.0f}%",
+                            f"📊 {STRATEGY_NAME} [{settings.scanner_mode.upper()}]",
+                            f"🧠 Smart-proxy ≥{settings.min_smart_wallets} wallets @ ≥{settings.min_smart_buy_ratio * 100:.0f}% buys",
+                            f"📈 CVD ≥{settings.cvd_min_buy_sell_ratio:.2f}x + ≥${settings.cvd_min_volume_usd:,.0f} / ≥{settings.cvd_min_trades} trades over {settings.cvd_window_seconds // 60}m",
+                            f"🕰 Age ≤{settings.max_token_age_hours}h | 🛡 Rug score ≤{settings.rugcheck_max_score} | 🏃 Chase ≤+{settings.entry_max_surge_pct:.0f}%",
+                            f"🛑 SL {settings.stop_loss_percent:.0f}% | 🔶 TP1 {settings.take_profit_percent:.0f}%×{settings.tp1_fraction:.0%} | 🔷 TP2 {settings.take_profit2_percent:.0f}%×{settings.tp2_fraction:.0%} | 🪝 Trail {settings.trail_stop_pct:.0f}%/{settings.trail_arm_pct:.0f}% | 💀 Quiet×{settings.volume_death_quiet_polls}",
+                            f"🧪 Sim {'ON (quote+simulate, never broadcast)' if (settings.sim_enabled and settings.private_key) else 'OFF'} | Route-required: {'yes' if settings.sim_require_route else 'no'}",
                         ),
                     )
                 )

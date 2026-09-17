@@ -92,8 +92,15 @@ class PaperPortfolio:
             balance_after_usd=self.cash_usd,
         )
 
-    def close(self, entry_price_usd: float, exit_price_usd: float, notional_usd: float) -> CloseResult:
-        """Settle one paper position and update realized stats."""
+    def close(self, entry_price_usd: float, exit_price_usd: float, notional_usd: float,
+              *, win_override: bool | None = None) -> CloseResult:
+        """Settle one paper position and update realized stats.
+
+        ``win_override`` forces the win/loss verdict: partial take-profits
+        settle through :meth:`close_partial` (never counted), and the final
+        runner close passes the verdict computed over partials + runner
+        combined, so one scaled exit counts as one trade.
+        """
         cash_before = self.cash_usd
         if entry_price_usd > 0 and notional_usd > 0:
             proceeds = notional_usd * exit_price_usd / entry_price_usd
@@ -103,10 +110,38 @@ class PaperPortfolio:
         pnl_pct = (exit_price_usd / entry_price_usd - 1.0) * 100.0 if entry_price_usd > 0 else 0.0
         self.cash_usd += proceeds
         self.realized_pnl_usd += pnl
-        if pnl >= 0:
+        won = (pnl >= 0) if win_override is None else win_override
+        if won:
             self.wins += 1
         else:
             self.losses += 1
+        return CloseResult(
+            pnl_usd=pnl,
+            pnl_pct=pnl_pct,
+            cash_before_usd=cash_before,
+            cash_after_usd=self.cash_usd,
+            realized_total_usd=self.realized_pnl_usd,
+            wins=self.wins,
+            losses=self.losses,
+            win_rate_pct=self.win_rate_pct,
+        )
+
+    def close_partial(self, entry_price_usd: float, exit_price_usd: float,
+                      notional_usd: float) -> CloseResult:
+        """Settle one scale-out slice: cash + realized move, no win/loss.
+
+        Win rate is judged once, on the whole position at final close
+        (see ``win_override``), so ladder rungs never inflate the count.
+        """
+        cash_before = self.cash_usd
+        if entry_price_usd > 0 and notional_usd > 0:
+            proceeds = notional_usd * exit_price_usd / entry_price_usd
+        else:
+            proceeds = notional_usd
+        pnl = proceeds - notional_usd
+        pnl_pct = (exit_price_usd / entry_price_usd - 1.0) * 100.0 if entry_price_usd > 0 else 0.0
+        self.cash_usd += proceeds
+        self.realized_pnl_usd += pnl
         return CloseResult(
             pnl_usd=pnl,
             pnl_pct=pnl_pct,

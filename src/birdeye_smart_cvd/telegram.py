@@ -110,6 +110,8 @@ class CloseAlert:
     open_positions: int = 0
     max_open_positions: int = 3
     timestamp: float = 0.0
+    # Advisory simulate-only execution check ("" when unavailable).
+    sim_text: str = ""
 
 
 @dataclass(slots=True)
@@ -138,7 +140,7 @@ def build_open_message(alert: OpenAlert) -> str:
         f"💰 Size: {cash(alert.notional_usd)}",
         f"🏦 Balance: {cash(alert.balance_before_usd)} → {cash(alert.balance_after_usd)}",
         f"📂 Positions: {alert.open_positions}/{alert.max_open_positions}",
-        f"🧠 Smart: {alert.smart_wallets} wallets, buys {alert.smart_buy_pct:.0f}%",
+        f"🧠 Smart-proxy: {alert.smart_wallets} wallets, buys {alert.smart_buy_pct:.0f}%",
         f"📈 CVD: ${alert.cvd_usd:+,.0f} ({alert.cvd_ratio:.2f}x)",
         f"🕰 Age: {alert.age_text}",
     ]
@@ -169,8 +171,10 @@ def build_close_message(alert: CloseAlert) -> str:
         f"💼 Realized total: {usd(alert.realized_total_usd)}",
         f"🏆 Win rate: {win_rate_text(alert.win_rate_pct, alert.wins, alert.losses)}",
         f"📂 Positions: {alert.open_positions}/{alert.max_open_positions}",
-        f"🕒 {utc_stamp(alert.timestamp)}",
     ]
+    if alert.sim_text:
+        lines.append(alert.sim_text)
+    lines.append(f"🕒 {utc_stamp(alert.timestamp)}")
     return "\n".join(lines)
 
 

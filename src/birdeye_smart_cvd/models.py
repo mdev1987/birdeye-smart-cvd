@@ -32,6 +32,9 @@ class TokenCandidate:
     top10_holder_pct: float | None = None
     # Where the current price_usd came from: discovery/trade/jupiter/dex.
     price_source: str = "discovery"
+    # Discovery-time price snapshot. Never overwritten by poll updates;
+    # the entry chase guard compares the live price against this.
+    discovery_price_usd: float = 0.0
 
 
 @dataclass(slots=True)
@@ -57,11 +60,21 @@ class CVDState:
     sell_volume_usd: float = 0.0
     seen_trade_ids: set[str] = field(default_factory=set)
     last_trade_timestamp: int = 0
+    # Number of trades currently inside the rolling window. Tracked
+    # explicitly (rather than len(seen_trade_ids)) so the entry gate can
+    # reject thin samples like "$2 buy / $0 sells" even when the ratio
+    # looks infinite.
+    trade_count: int = 0
 
     @property
     def cvd_usd(self) -> float:
         """Return cumulative buy volume minus sell volume."""
         return self.buy_volume_usd - self.sell_volume_usd
+
+    @property
+    def total_volume_usd(self) -> float:
+        """Return buy + sell volume inside the window."""
+        return self.buy_volume_usd + self.sell_volume_usd
 
     @property
     def buy_sell_ratio(self) -> float:
@@ -85,3 +98,22 @@ class PositionState:
     notional_usd: float = 0.0
     balance_before_open_usd: float = 0.0
     balance_after_open_usd: float = 0.0
+    # --- Profit-protection state (playbook: scale out, don't round-trip) ---
+    # Notional still exposed after partial take-profits.
+    remaining_notional_usd: float = 0.0
+    # Highest price seen since entry; anchors the trailing stop.
+    peak_price_usd: float = 0.0
+    # Realized paper PnL banked by partial take-profits (final win/loss is
+    # judged on partials + runner combined, not on the runner slice alone).
+    realized_pnl_usd: float = 0.0
+    tp1_done: bool = False
+    tp2_done: bool = False
+    # Latched once pnl first reaches TRAIL_ARM_PCT; stays armed even if
+    # price fades (that fade is exactly what the trail must catch).
+    trail_armed: bool = False
+    # Consecutive polls with zero *new* trades. Playbook: "exit immediately
+    # if volume dies". Reset on any poll that advances the CVD tape.
+    quiet_polls: int = 0
+    # Tagged smart-wallet count when the position opened; the runner log
+    # shows accumulation/attrition (e.g. "smart 2->4") as context.
+    smart_at_entry: int = 0

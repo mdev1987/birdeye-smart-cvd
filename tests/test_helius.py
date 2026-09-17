@@ -130,6 +130,35 @@ class HeliusClientTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_inbound_transfers_since_filter(self):
+        import json
+
+        bodies = []
+
+        def handler(request):
+            bodies.append(json.loads(request.content.decode()))
+            return httpx.Response(
+                200, json={"jsonrpc": "2.0", "id": 1,
+                           "result": {"data": [], "paginationToken": None}})
+
+        client = HeliusClient("k", "http://x", min_request_interval=0)
+        _swap_transport(client, handler)
+        try:
+            await client.inbound_transfers(WALLET, MINT, since_unix=1700000000)
+            params = bodies[-1]["params"]
+            self.assertEqual(
+                params["filters"], {"blockTime": {"gte": 1700000000}}
+            )
+            client2 = HeliusClient("k", "http://x", min_request_interval=0)
+            _swap_transport(client2, handler)
+            try:
+                await client2.inbound_transfers(WALLET, MINT)
+                self.assertNotIn("filters", bodies[-1]["params"])
+            finally:
+                await client2.close()
+        finally:
+            await client.close()
+
     async def test_api_key_appended_unless_present(self):
         client = HeliusClient("k", "https://mainnet.helius-rpc.com", min_request_interval=0)
         try:

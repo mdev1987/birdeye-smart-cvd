@@ -132,5 +132,21 @@ class CabalSpyEnvelopeTests(unittest.TestCase):
         self.assertEqual(CabalSpyClient._signal_items(None), [])
 
 
+class KeyRedactionTests(unittest.TestCase):
+    def test_helius_redact(self):
+        from birdeye_smart_cvd.helius import _redact as h_redact
+
+        scrubbed = h_redact("get https://x/?api-key=SECRET123 failed")
+        self.assertNotIn("SECRET123", scrubbed)
+        self.assertIn("api-key=***", scrubbed)
+
+    def test_cabalspy_redact(self):
+        from birdeye_smart_cvd.cabalspy import _redact as c_redact
+
+        scrubbed = c_redact("get https://x/?a=1&api_key=SECRET123 failed")
+        self.assertNotIn("SECRET123", scrubbed)
+        self.assertIn("api_key=***", scrubbed)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 [project]
 name = "birdeye-smart-cvd"
 version = "0.1.0"
-description = "Free-tier Birdeye Solana smart-money proxy + 15m CVD signal scanner"
+description = "Free-tier Birdeye Solana Smart-Money Proxy + 15m CVD signal scanner"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -9,6 +9,11 @@ dependencies = [
     "python-dotenv>=1.0,<2",
     "python-telegram-bot>=22.8",
     "telegramify-markdown>=1.2.0",
+    # Offline v0-transaction signing for simulate-only Jupiter checks
+    # (quote -> assemble with throwaway taker -> sign -> simulateTransaction,
+    # never broadcast). No solana-py needed; solders covers keypair + tx.
+    "solders>=0.23",
+    "base58>=2.1",
 ]
 
 [project.scripts]

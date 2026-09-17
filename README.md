@@ -1,6 +1,24 @@
-# Birdeye Smart Money + CVD Scanner
+# Birdeye Smart-Money Proxy + 15m CVD Scanner
 
 Signal-only Solana scanner built around the attached Birdeye playbook, using endpoints documented as available on the free Standard package.
+
+> Naming: the smart-money leg is a free-tier **proxy** from tagged top
+> traders, not Birdeye's paid Smart Money feed. The name says "Proxy"
+> everywhere (code, logs, alerts, docs) so backtests never confuse the two.
+
+## Scanner modes (`SCANNER_MODE`)
+
+```text
+CORE      Birdeye trending/overview/top-traders/trades + proxy + CVD
+RISK      CORE + RugCheck + Helius
+ENRICHED  RISK + Jupiter + DexScreener + CabalSpy   (default, full pipeline)
+```
+
+Run `CORE` first to test whether the raw strategy has edge before risk
+filters and enrichment influence the result. `CORE` makes no
+Jupiter/DexScreener/RugCheck/Helius/CabalSpy calls at all, which also
+keeps discovery cheap on the 1-RPS Birdeye tier. Telegram alerting is
+orthogonal and fires in every mode when configured.
 
 ## Strategy
 
@@ -11,12 +29,26 @@ Trending candidates (Birdeye)
     -> <24h age gate: Jupiter createdAt -> DexScreener oldest pool
        -> Birdeye creation_info (strict mode) -> unknown
     -> RugCheck veto (score / danger risks)
-    -> Top Traders tagged-wallet smart-money proxy
+    -> Top Traders tagged-wallet Smart-Money Proxy
     -> recent token trades
-    -> rolling 15m CVD (+ CabalSpy cluster confirmation, optional)
+    -> rolling 15m CVD (ratio ≥ threshold AND volume ≥ floor AND trades ≥ floor)
+    -> chase guard: live price must be within +ENTRY_MAX_SURGE_PCT of discovery
     -> BUY SIGNAL
-    -> paper exit on confirmed bearish CVD / TP / SL / TTL
+    -> paper exits: SL | TP1/TP2 partials (runner rides) | trailing stop |
+       confirmed bearish CVD | volume-died | TTL
     -> EXIT DROPPED_FROM_UNIVERSE when a holding leaves discovery
+```
+
+Profit protection follows the playbook risk rules (scale out instead of
+round-tripping): TP1 banks half at +50%, TP2 banks half of the remainder
+at +100%, a trailing stop (armed +20%, trails 30% from peak, latched)
+locks parabolic runners, and positions die immediately when the tape goes
+quiet (`VOLUME_DEATH_QUIET_POLLS` polls with zero new trades). One scaled
+exit counts as one trade in win rate; partials only move cash + realized.
+Every entry, TP1 scale-out, and final exit also carries a 🧪 Jupiter
+simulate-only note (route OK? executable fill vs signal? impact?
+simulate CU?) — quote + assemble + local throwaway sign + simulate,
+never broadcast.
 ```
 
 The playbook's dedicated Smart Money Token List is intentionally **not** used because Birdeye currently documents that endpoint as Starter+.
@@ -30,7 +62,8 @@ The playbook's dedicated Smart Money Token List is intentionally **not** used be
 | Jupiter lite Price v3 | free, keyless | token-level `createdAt` age oracle, poll price fallback | skipped with warning |
 | RugCheck summary | free (~3 RPS) | pre-entry veto (`score_normalised`, `danger` risks) | allowed as `rug:unknown` (strict mode rejects) |
 | CabalSpy | key required, inert without one | advisory cluster confirmation | skipped with info log |
-| Helius RPC + transfers | key required, inert without one | holder concentration (`top10%`), on-chain buy proof per tagged wallet | skipped with info log; veto/require gates default OFF |
+| Helius RPC + transfers | key required, inert without one | holder concentration (`top10%`), on-chain buy proof per tagged wallet, mint decimals, `simulateTransaction` RPC | skipped with info log; veto/require gates default OFF |
+| Jupiter Swap v2 | key + throwaway sim key, ENRICHED only | simulate-only execution check per entry/exit (quote → assemble → local sign → simulate, **never broadcast**) | advisory `🧪 Sim …` note; `SIM_REQUIRE_ROUTE=true` skips routeless entries |
 
 Every auxiliary source fails open (warn + continue) except under its explicit `*_STRICT` / `REQUIRE` flag. The scanner never sends transactions.
 
@@ -64,26 +97,79 @@ TELEGRAM_CHAT_ID=123456789          # message the bot, then getUpdates
 
 OPEN 🟢 reports entry price + source, size, balance before → after, open
 positions, smart/CVD stats, age, risk, cluster/Helius notes. CLOSE
-(🛑/🎯/📉/⏱/🗑) reports exit price, PnL $ + %, hold time, balance before →
-after, realized total, win rate and open positions. Without both vars the
-notifier stays inert (logged) and the scanner runs normally.
+(🛑/🔶/🔷/🪝/📉/💀/⏱/🗑) reports exit price, PnL $ + %, hold time, balance
+before → after, realized total, win rate and open positions. Partial
+take-profits arrive as CLOSE alerts marked `Partial TP1/TP2` while the
+runner stays open. Without both vars the notifier stays inert (logged)
+and the scanner runs normally.
 
 Paper accounting (`paper.py`): cash starts at `PAPER_START_BALANCE_USD`,
 each open reserves `PAPER_POSITION_SIZE_USD`, closes settle
 `size × exit/entry`. `MAX_OPEN_POSITIONS` (default 3) and insufficient
 funds both veto entries with a log line.
 
+## Run under supervision (`oxfile.toml`)
+
+```bash
+oxmgr validate ./oxfile.toml
+oxmgr apply ./oxfile.toml
+oxmgr logs birdeye-cvd -f
+```
+
+The bundled `oxfile.toml` runs `uv run birdeye-scanner` as `birdeye-cvd`
+with crash-loop protection (5 crashes / 5 min → error state, no hot-loop
+on a bad `.env`), a log-freshness health check (no output for 6 min →
+restart), `uv sync --frozen` gating reloads, and `PYTHONUNBUFFERED=1`
+so piped logs stay real-time. It supervises **this** project only — the
+previous file pointed at an unrelated bot (`ave_signal_trade`).
+
+## Security
+
+- `.env` is gitignored and never logged (Helius/CabalSpy error paths scrub
+  keys). `PRIVATE_KEY` must be a **throwaway** keypair: it only signs
+  locally so `simulateTransaction` accepts the payload — no funds needed,
+  and `jupsim.py` has no execute/send path by construction (regression
+  test fails the build if one is added). Never paste `.env` into chats,
+  tickets, or commits.
+- `JUPITER_API_KEY` authenticates Swap v2 `/order` (header); the Lite price
+  client stays keyless. `RUGCHECK_API_KEY` is inert (keyless client).
+  `HELIUS_RPC` / `HELIUS_TXS` / `HELIUS_TX_HISTORY` are legacy duplicates
+  of `HELIUS_RPC_URL`. `SHYFT_*` / `DBOTX_API_KEY` are reserved for future
+  execution work and are not read by any code path today.
+
+## Doc triage (why some `doc/` files change no code)
+
+- Playbook + CVD/Smart-Money guides → TP ladder, trailing lock,
+  volume-death exit, chase guard, smart-trend context (implemented above).
+- DexScreener API → pair-selection/age usage already matches the schema;
+  300 RPM headroom confirmed, no change needed.
+- Helius docs → `getTransfersByAddress` now pushes `filters.blockTime.gte`
+  server-side (client-side re-check retained as backstop).
+- Helius docs → `getTransfersByAddress` now pushes `filters.blockTime.gte`
+  server-side (client-side re-check retained as backstop); mint decimals via
+  parsed `getAccountInfo` (cached forever) for sim sizing.
+- Sibling `ave_signal_trade/src/jupiter_trade.py` (house pattern) → Swap v2
+  `/order` shape, taker-less RTSE quoting on buys, explicit slippage on
+  sells, v0 `0x80 || message` signing with solders, `simulateTransaction`
+  envelope. Reused for the simulate-only path; execution/retry/PumpAPI
+  machinery deliberately left behind.
+- DBot / Shyft / PumpAPI docs describe *live execution* (trailing-stop
+  tasks, `send_txn`, PumpSwap routing). Still unwired: nothing broadcasts,
+  so there is nothing to pre-flight, schedule, or route — wiring them
+  would add key-management risk for zero research benefit.
+
 ## Notes
 
 - The published Standard package is free, includes 30,000 CU, and is limited to 1 RPS.
 - This scanner therefore uses sequential REST polling and a small watchlist.
 - The CVD is calculated from Birdeye token trade `buy` / `sell` records; it is not a TradingView indicator request.
-- Smart-money participation is a proxy derived from tagged top traders (`smart_trader` by default; Birdeye documents `dev, bundler, sniper, insider, smart_trader`), not Birdeye's paid Smart Money Token List.
+- Smart-money participation is a **proxy** derived from tagged top traders (`smart_trader` by default; Birdeye documents `dev, bundler, sniper, insider, smart_trader`), not Birdeye's paid Smart Money Token List.
+- CVD entry needs all three: buy/sell ratio (`CVD_MIN_BUY_SELL_RATIO`, default 1.20x) **plus** window volume (`CVD_MIN_VOLUME_USD`, default $2,000) **plus** trade count (`CVD_MIN_TRADES`, default 10). Thin "$2 buy / $0 sells" windows have an infinite ratio but fail the sample-size floors. Tune these on historical data.
 - Market cap accepts `marketCap`/`marketcap` first, then falls back to `fdv`/`FDV` for early tokens; the source is logged (`MC=$482K [fdv]`).
 - Execution price chain: newest trade leg price (`price[trade]`) → Jupiter quote (`price[jupiter]`) → discovery snapshot (`price[discovery]`); the source is always logged.
 - Token age priority: Jupiter token-level `createdAt` → DexScreener oldest-pool `pairCreatedAt` (a pool cannot predate its tokens, so an old oldest-pool safely rejects) → Birdeye `token_creation_info` (Lite/Starter+, strict mode only) → `unknown` (allowed with warning unless `AGE_STRICT=true`). On free Standard the paid call is now skipped entirely.
 - Bearish-CVD exits require `BEARISH_EXIT_CONFIRMATIONS` (default 2) consecutive polls to avoid single-poll whipsaw.
-- `TXNs > 100` is deliberately not part of this strategy: it belongs to the broader Trending / Early Meme playbooks, not the Smart Money + CVD workflow.
+- `TXNs > 100` is deliberately not part of this strategy: it belongs to the broader Trending / Early Meme playbooks, not the Smart-Money Proxy + 15m CVD workflow.
 
 ## Tests
 

@@ -1,0 +1,40 @@
+version = 1
+
+# Birdeye Smart-Money Proxy + 15m CVD scanner (paper-signal only).
+# Apply with: oxmgr apply ./oxfile.toml   (from this directory)
+# Logs with:  oxmgr logs birdeye-cvd -f
+
+[[apps]]
+name = "birdeye-cvd"
+# Entry point defined in pyproject.toml [project.scripts]. `uv run` syncs
+# the locked venv first, so a rebooted host recovers without manual setup.
+command = "/usr/bin/env uv run birdeye-scanner"
+cwd = "/home/mdev/Programming/birdeye_smart_cvd"
+restart_policy = "always"
+max_restarts = 100
+# Stop after 5 crash-restarts inside 5 minutes: a persistent config error
+# (e.g. bad .env, exit code 2) must error-state, not hot-loop forever.
+# 0 would disable this protection entirely.
+crash_restart_limit = 5
+restart_delay_secs = 10
+stop_signal = "SIGTERM"
+stop_timeout_secs = 20
+# The bot logs every poll cycle (~30s) to stdout, which oxmgr captures to
+# <name>.log (unified_logs below merges stderr into the same file). A log
+# older than 6 minutes means the loop is stuck or wedged on network I/O ->
+# restart. Missing file = fresh boot, pass.
+health_cmd = "/bin/sh -c 'test ! -f /home/mdev/.local/share/oxmgr/logs/birdeye-cvd.log || test -n \"$(/usr/bin/find /home/mdev/.local/share/oxmgr/logs/birdeye-cvd.log -mmin -6 2>/dev/null)\"'"
+health_interval_secs = 60
+health_timeout_secs = 5
+health_max_failures = 3
+# Deps must resolve before a reload cuts over; a failed sync aborts the
+# reload and the old process keeps running.
+pre_reload_cmd = "/bin/sh -c 'cd /home/mdev/Programming/birdeye_smart_cvd && /home/mdev/.local/bin/uv sync --frozen'"
+unified_logs = true
+
+[apps.env]
+PATH = "/home/mdev/.cargo/bin:/usr/local/bin:/home/mdev/.local/bin:/usr/bin:/bin"
+HOME = "/home/mdev"
+# Unbuffered stdout: without this, Python block-buffers piped logs, so
+# `oxmgr logs -f` and the health check above would see stale output.
+PYTHONUNBUFFERED = "1"

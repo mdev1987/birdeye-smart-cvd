@@ -1,4 +1,4 @@
-"""Command-line entry point for the Birdeye Smart Money + CVD scanner."""
+"""Command-line entry point for the Birdeye Smart-Money Proxy + 15m CVD scanner."""
 
 from __future__ import annotations
 
