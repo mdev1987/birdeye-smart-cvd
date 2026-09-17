@@ -74,6 +74,28 @@ class BirdeyeClientTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_new_listing_params(self):
+        seen = []
+
+        def handler(request):
+            seen.append(dict(request.url.params))
+            return httpx.Response(
+                200, json={"success": True, "data": {"items": [{"address": "A"}]}}
+            )
+
+        client = BirdeyeClient("http://x", "k", min_request_interval=0)
+        _swap_transport(client, handler)
+        try:
+            rows = await client.new_listing(20, meme_platform_enabled=True)
+            self.assertEqual(rows, [{"address": "A"}])
+            self.assertEqual(seen[0]["limit"], "20")
+            self.assertEqual(seen[0]["meme_platform_enabled"], "true")
+            rows = await client.new_listing(500)
+            self.assertEqual(seen[1]["limit"], "20")
+            self.assertNotIn("meme_platform_enabled", seen[1])
+        finally:
+            await client.close()
+
     async def test_trending_paging_params(self):
         seen = []
 
@@ -98,6 +120,20 @@ class BirdeyeClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(seen[1]["limit"], "50")
         finally:
             await client.close()
+
+
+class CuExhaustedTests(unittest.TestCase):
+    def test_matches_quota_message(self):
+        from birdeye_smart_cvd.birdeye import BirdeyeError, is_cu_exhausted
+
+        exhausted = BirdeyeError(
+            'HTTP 400: {"success":false,'
+            '"message":"Compute units usage limit exceeded"}'
+        )
+        self.assertTrue(is_cu_exhausted(exhausted))
+        self.assertTrue(is_cu_exhausted(ValueError("COMPUTE UNITS USAGE LIMIT EXCEEDED")))
+        self.assertFalse(is_cu_exhausted(BirdeyeError("HTTP 429: slow down")))
+        self.assertFalse(is_cu_exhausted(ValueError("network down")))
 
 
 class DexScreenerClientTests(unittest.IsolatedAsyncioTestCase):

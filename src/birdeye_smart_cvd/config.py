@@ -69,6 +69,9 @@ class Settings:
     # Max trending rows inspected per discovery (across pages).
     candidate_limit: int = 100
     max_watched_tokens: int = 3
+    # When Birdeye reports CU exhaustion, discovery pauses this long
+    # instead of burning the (also metered) trending calls every cycle.
+    cu_cooldown_seconds: int = 1800
     # Trending pagination (per Birdeye spec: 25 CU per request whatever the
     # limit, max 50/page, ~1000 ranked). The old top-10-only view sees mega
     # caps exclusively; pages of 50 pre-filtered on row-native fields find
@@ -77,6 +80,12 @@ class Settings:
     trending_page_size: int = 50
     trending_max_pages: int = 2
     trending_interval: str = "24h"
+    # Second discovery source: fresh listings (Standard, 20 CU/request).
+    # Rows carry liquidity + ISO listing time but no marketcap, so they are
+    # pre-gated on those and judged on size at the overview stage.
+    newlisting_enabled: bool = True
+    newlisting_limit: int = 20
+    newlisting_meme_platforms: bool = False
 
     # Playbook universe: new/early, low-cap tokens with usable liquidity.
     min_market_cap_usd: float = 60_000
@@ -233,10 +242,14 @@ class Settings:
             discovery_interval_seconds=_int("DISCOVERY_INTERVAL_SECONDS", 300),
             poll_interval_seconds=_int("POLL_INTERVAL_SECONDS", 30),
             candidate_limit=_int("CANDIDATE_LIMIT", 100),
+            cu_cooldown_seconds=_int("CU_COOLDOWN_SECONDS", 1800),
             max_watched_tokens=_int("MAX_WATCHED_TOKENS", 3),
             trending_page_size=_int("TRENDING_PAGE_SIZE", 50),
             trending_max_pages=_int("TRENDING_MAX_PAGES", 2),
             trending_interval=(_raw("TRENDING_INTERVAL") or "24h").lower(),
+            newlisting_enabled=_bool("NEWLISTING_ENABLED", True),
+            newlisting_limit=_int("NEWLISTING_LIMIT", 20),
+            newlisting_meme_platforms=_bool("NEWLISTING_MEME_PLATFORMS", False),
             min_market_cap_usd=_float("MIN_MARKET_CAP_USD", 60_000),
             max_market_cap_usd=_float("MAX_MARKET_CAP_USD", 3_000_000),
             min_liquidity_usd=_float("MIN_LIQUIDITY_USD", 10_000),
@@ -331,12 +344,16 @@ class Settings:
             raise ValueError("POLL_INTERVAL_SECONDS must be >= 5 for the free 1 RPS tier")
         if not 1 <= settings.candidate_limit <= 1000:
             raise ValueError("CANDIDATE_LIMIT must be between 1 and 1000")
+        if settings.cu_cooldown_seconds < 0:
+            raise ValueError("CU_COOLDOWN_SECONDS must be >= 0 (0 disables)")
         if not 1 <= settings.trending_page_size <= 50:
             raise ValueError("TRENDING_PAGE_SIZE must be between 1 and 50 (API max)")
         if not 1 <= settings.trending_max_pages <= 20:
             raise ValueError("TRENDING_MAX_PAGES must be between 1 and 20")
         if settings.trending_interval not in {"1h", "4h", "24h"}:
             raise ValueError("TRENDING_INTERVAL must be one of: 1h, 4h, 24h")
+        if not 1 <= settings.newlisting_limit <= 20:
+            raise ValueError("NEWLISTING_LIMIT must be between 1 and 20 (API max)")
         if settings.min_market_cap_usd >= settings.max_market_cap_usd:
             raise ValueError("MIN_MARKET_CAP_USD must be below MAX_MARKET_CAP_USD")
         if settings.max_watched_tokens < 1:

@@ -29,6 +29,12 @@ their native fields, and only survivors pay for overview + enrichment —
 stopping early once the watchlist is full. Reading only offset 0–10 sees
 mega-caps exclusively; the in-band tokens live deeper in the ranking.
 
+Second source: `new_listing` (Standard, 20 CU) fills whatever watchlist
+slots trending leaves empty. Its rows carry liquidity + ISO `listingAddedAt`
+but no market cap, so they pre-gate on those two and are judged on size at
+the overview stage like everything else; trending survivors are never
+re-vetted. `NEWLISTING_MEME_PLATFORMS=true` adds pump.fun venues.
+
 ## Strategy
 
 ```text
@@ -193,3 +199,12 @@ uv run python -m unittest discover -s tests -v
 ## Rate limiting
 
 The client serializes requests (including 429 backoff) behind a single lock and waits 1.5 seconds between requests by default, anchored at response completion so slow answers can't compress the gap. Birdeye Standard is documented at 1 RPS, so the scanner intentionally does not use concurrent API calls. The 1.5s value comes from live runs: at start-anchored 1.15s Birdeye 429'd every second request (phase-locked just under its real window); completion-anchored 1.5s reduced that to the occasional retry, each recovered transparently. Tune with `API_MIN_REQUEST_INTERVAL_SECONDS` (minimum 1.0, enforced).
+
+## Quota exhaustion
+
+When Birdeye answers `Compute units usage limit exceeded`, discovery pauses
+for `CU_COOLDOWN_SECONDS` (default 30 min) instead of burning metered calls
+that all fail — polls and paper exits continue. Check usage and the reset
+date at bds.birdeye.so. Live diagnostics and backtest-style dry runs spend
+real CU too: keep probes small (`CORE` mode, tight limits) on a nearly
+exhausted key.

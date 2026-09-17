@@ -472,6 +472,82 @@ class FakeSim:
                          reason="simulated, not broadcast")
 
 
+class CuCooldownTests(unittest.IsolatedAsyncioTestCase):
+    def _settings(self, **over):
+        kw = {"api_key": "x"}
+        kw.update(over)
+        return Settings(**kw)
+
+    async def test_cu_failure_pauses_discovery(self):
+        from birdeye_smart_cvd.birdeye import BirdeyeError
+
+        stub = PagedBirdeye()
+        stub.trend_empty = True
+        stub.fresh = [
+            {"address": "F1", "liquidity": 50_000.0,
+             "liquidityAddedAt": _iso_hours_ago(1)},
+            {"address": "F2", "liquidity": 50_000.0,
+             "liquidityAddedAt": _iso_hours_ago(1)},
+        ]
+        orig_overview = stub.token_overview
+
+        async def failing_overview(address):
+            raise BirdeyeError(
+                'HTTP 400: {"success":false,'
+                '"message":"Compute units usage limit exceeded"}'
+            )
+
+        stub.token_overview = failing_overview
+        settings = self._settings(
+            candidate_limit=60, trending_page_size=50, trending_max_pages=3,
+            dexscreener_enabled=False, jupiter_enabled=False,
+            rugcheck_enabled=False, helius_enabled=False,
+            cabalspy_enabled=False, sim_enabled=False,
+        )
+        notices = FakeNotifier()
+        scanner = Scanner(stub, settings, notifier=notices)
+        scanner.dex = scanner.jup = scanner.rug = None
+        scanner.cabal = scanner.helius = scanner.jupsim = None
+        try:
+            self.assertFalse(scanner._cu_paused())
+            await scanner.discover()
+            # First CU failure pauses; the second row is never attempted.
+            self.assertTrue(scanner._cu_paused())
+            self.assertEqual(scanner.watched, {})
+        finally:
+            await scanner.aclose()
+
+    async def test_other_errors_do_not_pause(self):
+        from birdeye_smart_cvd.birdeye import BirdeyeError
+
+        stub = PagedBirdeye()
+        stub.trend_empty = True
+        stub.fresh = [
+            {"address": "F1", "liquidity": 50_000.0,
+             "liquidityAddedAt": _iso_hours_ago(1)},
+        ]
+
+        async def flaky_overview(address):
+            raise BirdeyeError("HTTP 500: internal error")
+
+        stub.token_overview = flaky_overview
+        settings = self._settings(
+            candidate_limit=60, trending_page_size=50, trending_max_pages=3,
+            dexscreener_enabled=False, jupiter_enabled=False,
+            rugcheck_enabled=False, helius_enabled=False,
+            cabalspy_enabled=False, sim_enabled=False,
+        )
+        notices = FakeNotifier()
+        scanner = Scanner(stub, settings, notifier=notices)
+        scanner.dex = scanner.jup = scanner.rug = None
+        scanner.cabal = scanner.helius = scanner.jupsim = None
+        try:
+            await scanner.discover()
+            self.assertFalse(scanner._cu_paused())
+        finally:
+            await scanner.aclose()
+
+
 class SimWiringTests(unittest.IsolatedAsyncioTestCase):
     def _scanner(self, fake, settings, notices):
         scanner = Scanner(fake, settings, notifier=notices)
@@ -546,6 +622,15 @@ class SimWiringTests(unittest.IsolatedAsyncioTestCase):
             await scanner.aclose()
 
 
+def _iso_hours_ago(hours):
+    import time
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(
+        time.time() - hours * 3600.0, tz=timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%S")
+
+
 class PagedBirdeye:
     """Stub trending: mega-cap page 1, one in-band row on full page 2."""
 
@@ -553,13 +638,22 @@ class PagedBirdeye:
         self.page_size = page_size
         self.trending_calls = []
         self.overview_calls = []
+        self.new_listing_calls = []
+        self.fresh = []
+        self.trend_empty = False
 
     def _big(self, i):
         return {"address": f"BIG{i}", "marketcap": 50_000_000 + i,
                 "liquidity": 1_000_000, "price24hChangePercent": 5.0}
 
+    async def new_listing(self, limit=20, *, meme_platform_enabled=False):
+        self.new_listing_calls.append((limit, meme_platform_enabled))
+        return list(self.fresh)
+
     async def trending(self, limit, *, offset=0, sort_by="rank", interval="24h"):
         self.trending_calls.append((limit, offset, interval))
+        if self.trend_empty:
+            return []
         if offset == 0:
             return [self._big(i) for i in range(self.page_size)]
         if offset == self.page_size:
@@ -619,6 +713,89 @@ class DiscoverPaginationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(scanner.watched), 1)
             # Watchlist filled from page 2's survivor: no page 3 fetched.
             self.assertEqual(len(scanner.client.trending_calls), 2)
+        finally:
+            await scanner.aclose()
+
+    def _bare_settings(self, **over):
+        kw = {
+            "api_key": "x",
+            "candidate_limit": 60,
+            "trending_page_size": 50,
+            "trending_max_pages": 3,
+            "max_watched_tokens": 3,
+            "dexscreener_enabled": False,
+            "jupiter_enabled": False,
+            "rugcheck_enabled": False,
+            "helius_enabled": False,
+            "cabalspy_enabled": False,
+            "sim_enabled": False,
+        }
+        kw.update(over)
+        return Settings(**kw)
+
+    def _bare_scanner(self, stub, settings, notices):
+        scanner = Scanner(stub, settings, notifier=notices)
+        scanner.dex = scanner.jup = scanner.rug = None
+        scanner.cabal = scanner.helius = scanner.jupsim = None
+        return scanner
+
+    async def test_new_listing_fills_empty_watchlist(self):
+        stub = PagedBirdeye()
+        stub.trend_empty = True
+        stub.fresh = [
+            {"address": "FRESH1", "liquidity": 30_000.0,
+             "liquidityAddedAt": _iso_hours_ago(1)},
+        ]
+        settings = self._bare_settings()
+        notices = FakeNotifier()
+        scanner = self._bare_scanner(stub, settings, notices)
+        try:
+            await scanner.discover()
+            # Empty trending rang once; the fresh listing was vetted.
+            self.assertEqual(len(stub.trending_calls), 1)
+            self.assertEqual(len(stub.new_listing_calls), 1)
+            self.assertEqual(stub.overview_calls, ["FRESH1"])
+            self.assertIn("FRESH1", scanner.watched)
+        finally:
+            await scanner.aclose()
+
+    async def test_new_listing_dedupes_trending_survivor(self):
+        stub = PagedBirdeye()
+        stub.fresh = [
+            {"address": "SMALL1", "liquidity": 50_000.0,
+             "liquidityAddedAt": _iso_hours_ago(1)},
+            {"address": "FRESH2", "liquidity": 40_000.0,
+             "liquidityAddedAt": _iso_hours_ago(2)},
+        ]
+        settings = self._bare_settings(max_watched_tokens=5)
+        notices = FakeNotifier()
+        scanner = self._bare_scanner(stub, settings, notices)
+        try:
+            await scanner.discover()
+            # SMALL1 vetted once via trending; FRESH2 via new listings.
+            self.assertEqual(stub.overview_calls, ["SMALL1", "FRESH2"])
+            self.assertIn("SMALL1", scanner.watched)
+            self.assertIn("FRESH2", scanner.watched)
+        finally:
+            await scanner.aclose()
+
+    async def test_old_listing_skipped_without_overview(self):
+        stub = PagedBirdeye()
+        stub.trend_empty = True
+        stub.fresh = [
+            {"address": "OLD1", "liquidity": 90_000.0,
+             "liquidityAddedAt": _iso_hours_ago(120)},
+            {"address": "THIN1", "liquidity": 100.0,
+             "liquidityAddedAt": _iso_hours_ago(1)},
+        ]
+        settings = self._bare_settings()
+        notices = FakeNotifier()
+        scanner = self._bare_scanner(stub, settings, notices)
+        try:
+            await scanner.discover()
+            # Days-old and dust listings die at the pre-gate: no overview.
+            self.assertEqual(stub.overview_calls, [])
+            self.assertEqual(scanner.watched, {})
         finally:
             await scanner.aclose()
 

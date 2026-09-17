@@ -14,6 +14,17 @@ class BirdeyeError(RuntimeError):
     """Raised when Birdeye returns an unsuccessful API response."""
 
 
+def is_cu_exhausted(exc: BaseException) -> bool:
+    """True when an error means the API key is out of compute units.
+
+    Birdeye answers quota exhaustion with HTTP 400
+    ``{"success":false,"message":"Compute units usage limit exceeded"}``,
+    which surfaces here as ``HTTP 400: ...``. Matching is substring-based
+    so client-side wrapping never hides it.
+    """
+    return "compute units usage limit exceeded" in str(exc).lower()
+
+
 class BirdeyeClient:
     """Async HTTP client with authentication and a strict request rate limit.
 
@@ -179,12 +190,24 @@ class BirdeyeClient:
         )
         return payload.get("data", {}) if isinstance(payload.get("data"), dict) else {}
 
-    async def new_listing(self, limit: int = 20) -> list[dict[str, Any]]:
-        """Return recently listed tokens (Standard-accessible age oracle)."""
-        payload = await self.get(
-            "/defi/v2/tokens/new_listing",
-            {"limit": min(max(limit, 1), 20)},
-        )
+    async def new_listing(
+        self,
+        limit: int = 20,
+        *,
+        meme_platform_enabled: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return recently listed tokens (Standard tier, 20 CU/request).
+
+        Per the spec this is fresh-launch monitoring: rows carry address,
+        symbol/decimals, venue ``source``, ISO ``liquidityAddedAt`` and
+        ``liquidity`` — but no marketcap or momentum, so callers pre-gate
+        on liquidity + listing age and let the overview stage judge size.
+        ``meme_platform_enabled`` adds pump.fun-style venues (Solana only).
+        """
+        params: dict[str, Any] = {"limit": min(max(limit, 1), 20)}
+        if meme_platform_enabled:
+            params["meme_platform_enabled"] = True
+        payload = await self.get("/defi/v2/tokens/new_listing", params)
         return self._items(payload)
 
     async def token_trades(

@@ -387,6 +387,39 @@ def trending_row_passes(
     return True
 
 
+def newlisting_row_passes(
+    row: dict[str, Any],
+    *,
+    min_liquidity_usd: float,
+    max_token_age_hours: int,
+    enforce_token_age: bool,
+    age_strict: bool,
+    now: float | None = None,
+) -> tuple[bool, float | None]:
+    """Pre-filter one new-listing row: (passes, age_hours_or_None).
+
+    New-listing rows carry no marketcap/fdv or momentum (that verdict stays
+    at the overview stage, which has the FDV fallback); they do carry
+    ``liquidity`` and ISO ``liquidityAddedAt``. The listing timestamp is a
+    cheap age pre-gate so days-old listings never cost an overview call.
+    Unknown age follows the same policy as everywhere: allowed unless
+    strict mode demands rejection. Pure function (``now`` injectable).
+    """
+    import time as _time
+
+    liquidity = _parse_float(row.get("liquidity")) or 0.0
+    if liquidity < min_liquidity_usd:
+        return False, None
+    stamp = parse_iso_unix(row.get("liquidityAddedAt"))
+    if stamp is None:
+        return (not (enforce_token_age and age_strict)), None
+    age_hours = (now if now is not None else _time.time()) - stamp
+    age_hours /= 3600.0
+    if enforce_token_age and age_hours > max_token_age_hours:
+        return False, age_hours
+    return True, age_hours
+
+
 # ---------------------------------------------------------------------------
 # Multi-source enrichment: DexScreener ages, Jupiter birth/price, RugCheck
 # verdicts and CabalSpy cluster matches. All pure functions; every network

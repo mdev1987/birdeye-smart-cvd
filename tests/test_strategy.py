@@ -327,6 +327,63 @@ class TrendingRowTests(unittest.TestCase):
         self.assertFalse(trending_row_passes(row, **self._args()))
 
 
+class NewListingRowTests(unittest.TestCase):
+    def _args(self, **over):
+        kw = {
+            "min_liquidity_usd": 10_000,
+            "max_token_age_hours": 24,
+            "enforce_token_age": True,
+            "age_strict": False,
+        }
+        kw.update(over)
+        return kw
+
+    def test_fresh_liquid_passes(self):
+        from birdeye_smart_cvd.strategy import (
+            newlisting_row_passes,
+            parse_iso_unix,
+        )
+
+        listed = parse_iso_unix("2026-09-17T03:50:00")
+        self.assertIsNotNone(listed)
+        assert listed is not None
+        row = {"liquidity": 15_507.0, "liquidityAddedAt": "2026-09-17T03:50:00"}
+        ok, age = newlisting_row_passes(row, now=listed + 7200.0, **self._args())
+        self.assertTrue(ok)
+        self.assertAlmostEqual(age, 2.0)
+
+    def test_age_math(self):
+        from birdeye_smart_cvd.strategy import newlisting_row_passes
+
+        # liquidityAddedAt 2024-09-18T17:59:23Z == 1726682363.
+        row = {"liquidity": 32_994.0, "liquidityAddedAt": "2024-09-18T17:59:23"}
+        ok, age = newlisting_row_passes(
+            row, now=1726682363.0 + 3600.0, **self._args())
+        self.assertTrue(ok)
+        self.assertAlmostEqual(age, 1.0)
+        old, age = newlisting_row_passes(
+            row, now=1726682363.0 + 25 * 3600.0, **self._args())
+        self.assertFalse(old)
+
+    def test_low_liquidity_blocks(self):
+        from birdeye_smart_cvd.strategy import newlisting_row_passes
+
+        row = {"liquidity": 500.0, "liquidityAddedAt": "2024-09-18T17:59:23"}
+        ok, _ = newlisting_row_passes(
+            row, now=1726682363.0 + 60.0, **self._args())
+        self.assertFalse(ok)
+
+    def test_unknown_age_policy(self):
+        from birdeye_smart_cvd.strategy import newlisting_row_passes
+
+        row = {"liquidity": 50_000.0}
+        ok, age = newlisting_row_passes(row, **self._args())
+        self.assertTrue(ok)
+        self.assertIsNone(age)
+        ok, _ = newlisting_row_passes(row, **self._args(age_strict=True))
+        self.assertFalse(ok)
+
+
 class StrategyNameTests(unittest.TestCase):
     def test_canonical_name_says_proxy(self):
         from birdeye_smart_cvd.strategy import STRATEGY_NAME
@@ -448,6 +505,23 @@ class LifecycleConfigTests(unittest.TestCase):
         self.assertEqual(s.entry_max_surge_pct, 0)
 
 
+class NewListingConfigTests(unittest.TestCase):
+    def _settings(self, **env):
+        return _settings_from_mock_env(**env)
+
+    def test_new_listing_defaults(self):
+        s = self._settings()
+        self.assertTrue(s.newlisting_enabled)
+        self.assertEqual(s.newlisting_limit, 20)
+        self.assertFalse(s.newlisting_meme_platforms)
+
+    def test_new_listing_validation(self):
+        with self.assertRaises(ValueError):
+            self._settings(NEWLISTING_LIMIT="21")
+        with self.assertRaises(ValueError):
+            self._settings(NEWLISTING_LIMIT="0")
+
+
 class SimConfigTests(unittest.TestCase):
     def _settings(self, **env):
         return _settings_from_mock_env(**env)
@@ -486,6 +560,7 @@ class TrendingConfigTests(unittest.TestCase):
         self.assertEqual(s.trending_max_pages, 2)
         self.assertEqual(s.trending_interval, "24h")
         self.assertEqual(s.candidate_limit, 100)
+        self.assertEqual(s.cu_cooldown_seconds, 1800)
 
     def test_trending_validation(self):
         with self.assertRaises(ValueError):

@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 
-from .birdeye import BirdeyeClient, BirdeyeError
+from .birdeye import BirdeyeClient, BirdeyeError, is_cu_exhausted
 from .cabalspy import CabalSpyClient, CabalSpyError
 from .config import Settings
 from .dexscreener import DexScreenerClient, DexScreenerError
@@ -26,6 +26,7 @@ from .strategy import (
     jupiter_age_unix,
     jupiter_price_usd,
     latest_trade_price,
+    newlisting_row_passes,
     normalize_trade,
     pair_age_info,
     parse_cluster_for_token,
@@ -65,6 +66,10 @@ class Scanner:
         self.positions: dict[str, PositionState] = {}
         self.last_discovery = 0.0
         self.watched: dict[str, TokenCandidate] = {}
+        # Birdeye CU-exhaustion cooldown: discovery pauses instead of
+        # burning metered calls that all fail. Positions keep polling
+        # (polls read, they don't discover) and paper exits still fire.
+        self._cu_cooldown_until = 0.0
         # Peak tagged smart-wallet count seen per watched token this session.
         # Playbook: entries are better when smart participation *grows*; the
         # trend is logged as context (advisory, never a gate).
@@ -382,7 +387,10 @@ class Scanner:
         try:
             overview = await self.client.token_overview(address)
         except BirdeyeError as exc:
-            log.warning("overview failed %s: %s", address[:8], exc)
+            if is_cu_exhausted(exc):
+                self._note_cu_exhausted()
+            else:
+                log.warning("overview failed %s: %s", address[:8], exc)
             return None
 
         # Free keyless enrichment (never billed, fail-open). Fetched
@@ -437,6 +445,23 @@ class Scanner:
         candidate.discovery_price_usd = candidate.price_usd
         return candidate
 
+    def _note_cu_exhausted(self) -> None:
+        """Pause discovery: the key is out of Birdeye compute units."""
+        if self.settings.cu_cooldown_seconds <= 0:
+            return
+        until = time.time() + self.settings.cu_cooldown_seconds
+        if until > self._cu_cooldown_until:
+            self._cu_cooldown_until = until
+            log.error(
+                "Birdeye CU quota exhausted — check usage/reset at "
+                "bds.birdeye.so; discovery paused %dm (polling continues)",
+                self.settings.cu_cooldown_seconds // 60,
+            )
+
+    def _cu_paused(self) -> bool:
+        """True while a CU-exhaustion cooldown is in effect."""
+        return time.time() < self._cu_cooldown_until
+
     async def discover(self) -> None:
         """Discover a small candidate universe from Birdeye Trending.
 
@@ -467,6 +492,9 @@ class Scanner:
                     interval=settings.trending_interval,
                 )
             except BirdeyeError as exc:
+                if is_cu_exhausted(exc):
+                    self._note_cu_exhausted()
+                    return
                 log.warning("trending page %d failed: %s", pages, exc)
                 break
             pages += 1
@@ -501,10 +529,62 @@ class Scanner:
                     continue
                 candidate = await self._vet_row(address, stats)
                 if candidate is None:
+                    if self._cu_paused():
+                        break  # quota gone: stop burning calls this cycle
                     continue
                 candidates[address] = candidate
             if len(page) < settings.trending_page_size:
                 break  # short page: ranking exhausted
+
+        # Second source: fresh listings (Standard, 20 CU). Rows carry
+        # liquidity + listing time but no marketcap, so they pre-gate on
+        # those and are judged on size at the overview stage. Skipped
+        # entirely when trending already filled the watchlist.
+        new_listings = 0
+        if (
+            settings.newlisting_enabled
+            and len(candidates) < settings.max_watched_tokens
+        ):
+            try:
+                fresh = await self.client.new_listing(
+                    settings.newlisting_limit,
+                    meme_platform_enabled=settings.newlisting_meme_platforms,
+                )
+            except BirdeyeError as exc:
+                if is_cu_exhausted(exc):
+                    self._note_cu_exhausted()
+                else:
+                    log.warning("new listings failed: %s", exc)
+                fresh = []
+            for row in fresh:
+                if len(candidates) >= settings.max_watched_tokens:
+                    break
+                if not isinstance(row, dict):
+                    stats["base"] += 1
+                    continue
+                address = str(row.get("address", row.get("token", "")))
+                if address and address in candidates:
+                    continue  # already vetted via trending
+                if not address:
+                    stats["base"] += 1
+                    continue
+                passes, _listed_age = newlisting_row_passes(
+                    row,
+                    min_liquidity_usd=settings.min_liquidity_usd,
+                    max_token_age_hours=settings.max_token_age_hours,
+                    enforce_token_age=settings.enforce_token_age,
+                    age_strict=settings.age_strict,
+                )
+                new_listings += 1
+                if not passes:
+                    stats["base"] += 1
+                    continue
+                candidate = await self._vet_row(address, stats)
+                if candidate is None:
+                    if self._cu_paused():
+                        break  # quota gone: stop burning calls this cycle
+                    continue
+                candidates[address] = candidate
 
         await self._retire_dropped(candidates)
         self.watched = candidates
@@ -513,10 +593,11 @@ class Scanner:
 
         self.last_discovery = time.time()
         log.info(
-            "discovered %d candidates (%d rows/%d pages, %d base-filtered, %d age/risk-filtered) [mode=%s]",
+            "discovered %d candidates (%d rows/%d pages + %d new listings, %d base-filtered, %d age/risk-filtered) [mode=%s]",
             len(self.watched),
             scanned,
             pages,
+            new_listings,
             stats["base"],
             stats["gated"],
             self.settings.scanner_mode.upper(),
@@ -1178,12 +1259,21 @@ class Scanner:
         while True:
             now = time.time()
             if now - self.last_discovery >= self.settings.discovery_interval_seconds:
-                try:
-                    await self.discover()
-                except BirdeyeError as exc:
-                    log.error("discovery failed: %s", exc)
-                except Exception as exc:  # noqa: BLE001 - loop must survive aux bugs
-                    log.error("discovery failed unexpectedly: %s", exc, exc_info=True)
+                if self._cu_paused():
+                    left_m = int((self._cu_cooldown_until - now) // 60)
+                    log.info(
+                        "discovery paused (CU quota exhausted, ~%dm left)", left_m
+                    )
+                    # Pretend a cycle ran so this logs once per interval,
+                    # not once per 30s poll.
+                    self.last_discovery = now
+                else:
+                    try:
+                        await self.discover()
+                    except BirdeyeError as exc:
+                        log.error("discovery failed: %s", exc)
+                    except Exception as exc:  # noqa: BLE001 - loop must survive aux bugs
+                        log.error("discovery failed unexpectedly: %s", exc, exc_info=True)
 
             # Sequential polling is intentional: Standard is documented at
             # 1 request/sec, so we avoid concurrent bursts.
